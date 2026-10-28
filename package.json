@@ -1,0 +1,22 @@
+{
+  "name": "heyhye-blog-helper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "네이버 블로그 초안 생성 + 크롬 글쓰기 화면 자동 채우기 (발행은 사람이)",
+  "type": "module",
+  "scripts": {
+    "login": "node src/login.js",
+    "draft": "node src/draft.js",
+    "fill": "node src/fill.js",
+    "post": "node src/draft.js && node src/fill.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.3.0",
+    "dotenv": "^18.0.9",
+    "playwright": "^1.64.1",
+    "zod": "^4.6.7"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
