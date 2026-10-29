@@ -1,0 +1,10 @@
+node_modules/
+.env
+.naver-profile/
+logs/
+drafts/*.json
+drafts/*.md
+!drafts/.gitkeep
+references/*.json
+references/*.md
+!references/.gitkeep
