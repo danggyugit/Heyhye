@@ -138,10 +138,10 @@ export async function writePost(page, draft, { publish = false } = {}) {
 
 export async function postDraftFile(file, { publish = false, headless = true } = {}) {
   const draft = JSON.parse(fs.readFileSync(file, "utf8"));
-  const { context, page } = await openBrowser({ headless });
+  const { context, page, close } = await openBrowser({ headless });
   try {
     if (!(await isLoggedIn(context))) {
-      throw new Error("네이버 로그인 세션이 없습니다. 먼저 `npm run login` 을 실행하세요.");
+      throw new Error("네이버 로그인 세션이 없습니다. 먼저 `npm run chrome` 으로 띄운 크롬에서 로그인하거나 `npm run login` 을 실행하세요.");
     }
     const result = await writePost(page, draft, { publish });
     return result;
@@ -149,7 +149,7 @@ export async function postDraftFile(file, { publish = false, headless = true } =
     await snapshot(page, "error");
     throw e;
   } finally {
-    await context.close();
+    await close();
   }
 }
 

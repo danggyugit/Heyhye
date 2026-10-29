@@ -1,6 +1,7 @@
 /**
- * 네이버에 한 번 수동 로그인해서 세션을 .naver-profile 에 저장한다.
- * 창이 뜨면 직접 아이디/비밀번호(+2단계 인증)를 입력하면 된다.
+ * 네이버 로그인 세션을 만든다.
+ *  - 켜져 있는 크롬에 붙은 경우: 그 크롬에 로그인 탭을 열어 주고 로그인될 때까지 기다린다.
+ *  - 아니면 창을 띄워서 직접 로그인하면 .naver-profile 에 세션이 저장된다.
  *
  *   npm run login
  */
@@ -8,10 +9,10 @@ import { openBrowser, isLoggedIn, snapshot } from "./browser.js";
 import { config } from "./config.js";
 
 async function main() {
-  const { context, page } = await openBrowser({ headless: false });
+  const { mode, context, page, close } = await openBrowser({ headless: false });
   try {
     if (await isLoggedIn(context)) {
-      console.log("이미 로그인되어 있습니다. 세션을 다시 만들려면 .naver-profile 폴더를 지우고 다시 실행하세요.");
+      console.log(`이미 로그인되어 있습니다 (${mode}).`);
       return;
     }
     await page.goto("https://nid.naver.com/nidlogin.login?url=https%3A%2F%2Fblog.naver.com%2F" + config.blogId, {
@@ -21,7 +22,7 @@ async function main() {
     const deadline = Date.now() + 5 * 60 * 1000;
     while (Date.now() < deadline) {
       if (await isLoggedIn(context)) {
-        console.log(`로그인 완료. 세션이 ${config.profileDir} 에 저장되었습니다.`);
+        console.log(mode === "cdp" ? "로그인 완료. 크롬을 닫지 않는 한 세션이 유지됩니다." : `로그인 완료. 세션이 ${config.profileDir} 에 저장되었습니다.`);
         await snapshot(page, "login-ok");
         return;
       }
@@ -29,7 +30,7 @@ async function main() {
     }
     throw new Error("5분 안에 로그인이 확인되지 않았습니다.");
   } finally {
-    await context.close();
+    await close();
   }
 }
 

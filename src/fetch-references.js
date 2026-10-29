@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { config, postViewUrl } from "./config.js";
-import { openEphemeralBrowser } from "./browser.js";
+import { openBrowser } from "./browser.js";
 
 export function parseLogNo(arg) {
   const m = String(arg).match(/logNo=(\d+)/) || String(arg).match(/blog\.naver\.com\/[^/]+\/(\d+)/) || String(arg).match(/^(\d+)$/);
@@ -136,7 +136,7 @@ export function saveReference(post) {
 async function main() {
   const args = process.argv.slice(2);
   const logNos = (args.length ? args : config.referenceLogNos).map(parseLogNo);
-  const { browser, page } = await openEphemeralBrowser();
+  const { page, close } = await openBrowser({ needLogin: false });
   try {
     for (const logNo of logNos) {
       const post = await fetchReference(page, logNo);
@@ -145,7 +145,7 @@ async function main() {
       console.log(`[${logNo}] ${post.title} — 블록 ${post.blocks.length}개, 본문 ${words}자 → ${base}.md`);
     }
   } finally {
-    await browser.close();
+    await close();
   }
 }
 

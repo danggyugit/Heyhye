@@ -5,7 +5,7 @@
  */
 import fs from "node:fs";
 import { config } from "./config.js";
-import { openEphemeralBrowser } from "./browser.js";
+import { openBrowser } from "./browser.js";
 import { fetchReference, saveReference } from "./fetch-references.js";
 import { generatePost, saveDraft, draftToMarkdown, loadReferences, parseArgs } from "./generate-post.js";
 import { postDraftFile } from "./post-to-naver.js";
@@ -14,11 +14,11 @@ async function ensureReferences() {
   const existing = loadReferences();
   if (existing.length) return existing;
   console.log("참고 글이 없어 먼저 가져옵니다...");
-  const { browser, page } = await openEphemeralBrowser();
+  const { page, close } = await openBrowser({ needLogin: false });
   try {
     for (const logNo of config.referenceLogNos) saveReference(await fetchReference(page, logNo));
   } finally {
-    await browser.close();
+    await close();
   }
   return loadReferences();
 }

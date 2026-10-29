@@ -8,3 +8,4 @@ drafts/*.md
 references/*.json
 references/*.md
 !references/.gitkeep
+.chrome-profile/

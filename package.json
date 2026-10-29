@@ -6,6 +6,7 @@
   "description": "기존 네이버 블로그 글을 참고해 새 글을 생성하고, 헤드리스 크롬으로 네이버 블로그에 자동 게시하는 도구",
   "scripts": {
     "fetch": "node src/fetch-references.js",
+    "chrome": "node src/launch-chrome.js",
     "login": "node src/naver-login.js",
     "generate": "node src/generate-post.js",
     "post": "node src/post-to-naver.js",
