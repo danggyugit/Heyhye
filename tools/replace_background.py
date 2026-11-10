@@ -2,7 +2,7 @@
 
 제품 픽셀은 일절 수정하지 않는다. 마스크 안쪽 픽셀은 원본 값을 그대로
 복사하고, 배경만 참고 이미지의 색감으로 새로 만든다. 바닥에 비친 반사 띠는
-마스크에서 제외한다.
+마스크에서 제외하고, 제품 실루엣으로 만든 자연스러운 접지 그림자를 더한다.
 
 사용법:
     python tools/replace_background.py product.jpg bg_reference.jpg out.jpg
@@ -33,17 +33,59 @@ def product_mask(img_bgr):
     return a
 
 
-def make_background(ref_bgr, w, h):
-    """참고 배경을 캔버스 크기로 늘리고 블러+미세 노이즈로 매끈하게."""
-    bg = cv2.resize(ref_bgr, (w, h), interpolation=cv2.INTER_CUBIC).astype(np.float32)
-    bg = cv2.GaussianBlur(bg, (0, 0), sigmaX=w / 60)
-    rng = np.random.default_rng(0)
-    bg += rng.normal(0, 1.2, (h, w, 1)).astype(np.float32)  # 밴딩 방지용 그레인
-    # 가장자리를 아주 살짝 어둡게 해서 제품에 시선이 모이게
+def make_background(ref_bgr, w, h, horizon):
+    """참고 배경 색감으로 '벽 + 바닥' 스튜디오 배경을 만든다.
+
+    원본 사진과 같은 원근(벽과 바닥이 만나는 선)을 유지해야 제품이
+    바닥 위에 놓인 것처럼 보인다.
+    """
+    rh = ref_bgr.shape[0]
+    ref = ref_bgr.astype(np.float32)
+    wall = np.median(ref[: int(rh * 0.5)].reshape(-1, 3), 0)
+    floor_far = np.median(ref[int(rh * 0.83): int(rh * 0.88)].reshape(-1, 3), 0)
+    floor_near = np.median(ref[int(rh * 0.95):].reshape(-1, 3), 0)
+    y = np.arange(h, dtype=np.float32)
+    t = np.clip((y - horizon) / (h - horizon), 0, 1)[:, None]
+    floor = floor_far * (1 - t) + floor_near * t
+    wall_col = wall * (1 + 0.015 * (1 - y / max(horizon, 1)))[:, None]  # 위로 갈수록 살짝 밝게
+    s = np.clip((y - horizon) / (h * 0.03) + 0.5, 0, 1)[:, None]          # 벽-바닥 경계 부드럽게
+    s = s * s * (3 - 2 * s)
+    col = wall_col * (1 - s) + floor * s
+    bg = np.repeat(col[:, None, :], w, axis=1)
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    d = np.sqrt(((xx - w / 2) / (w / 2)) ** 2 + ((yy - h * 0.55) / (h / 2)) ** 2)
-    bg *= (1.0 - 0.07 * np.clip(d - 0.3, 0, 1))[..., None]
+    d = np.sqrt(((xx - w / 2) / (w / 2)) ** 2 + ((yy - h * 0.6) / (h / 2)) ** 2)
+    bg *= (1.0 - 0.06 * np.clip(d - 0.35, 0, 1))[..., None]               # 은은한 비네팅
+    rng = np.random.default_rng(0)
+    bg += rng.normal(0, 1.2, (h, w, 1)).astype(np.float32)               # 밴딩 방지 그레인
     return bg
+
+
+def add_contact_shadow(bg, alpha):
+    """제품 바닥 테두리를 따라가는 접지 그림자.
+
+    임의의 타원 대신 제품 실루엣을 아래로 몇 px 내린 뒤 블러해서,
+    바닥 곡선 바로 아래에만 얇게 생기는 그림자를 만든다.
+    옆면 쪽으로는 점점 사라지게 해서 옆으로 튀어나오지 않는다.
+    """
+    h, w = alpha.shape
+    ys, xs = np.nonzero(alpha > 0.5)
+    bot = ys.max()
+    rw = (xs.max() - xs.min()) / 2
+
+    def drop(px, sigma):
+        M = np.float32([[1, 0, 0], [0, 1, px]])
+        sh = cv2.warpAffine(alpha, M, (w, h), flags=cv2.INTER_LINEAR)
+        return cv2.GaussianBlur(sh, (0, 0), sigma)
+
+    contact = drop(rw * 0.008, rw * 0.008)   # 테두리에 딱 붙은 짙은 선
+    ambient = drop(rw * 0.045, rw * 0.06)    # 그 아래 옅게 퍼지는 그늘
+    # 바닥에 가까운 높이에서만 그림자가 생기도록 (옆면 위쪽은 0)
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    band = rw * 0.35
+    weight = np.clip((yy - (bot - band)) / band, 0, 1) ** 1.5
+    s = np.clip((contact * 0.70 + ambient * 0.42) * weight, 0, 0.6)
+    tint = np.array([0.55, 0.62, 0.70], np.float32)  # 배경과 같은 따뜻한 톤 (BGR 곱)
+    return bg * (1 - s[..., None] * (1 - tint))
 
 
 def remove_bottom_reflection(img_bgr, alpha, search=32, thr=185):
@@ -115,7 +157,8 @@ def main():
     img_t = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_NEAREST)
     alpha = cv2.warpAffine(alpha, M, (w, h), flags=cv2.INTER_NEAREST)
 
-    bg = make_background(ref, w, h)
+    horizon = int(np.nonzero(alpha > 0.5)[0].min() - h * 0.06)  # 원본처럼 제품 뒤쪽에 벽-바닥 경계
+    bg = add_contact_shadow(make_background(ref, w, h, horizon), alpha)
     a = alpha[..., None]
     out = img_t.astype(np.float32) * a + bg * (1 - a)
     out = np.clip(np.rint(out), 0, 255).astype(np.uint8)
