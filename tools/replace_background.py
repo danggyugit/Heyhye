@@ -5,7 +5,8 @@
 마스크에서 제외하고, 제품 실루엣으로 만든 자연스러운 접지 그림자를 더한다.
 
 사용법:
-    python tools/replace_background.py product.jpg bg_reference.jpg out.jpg
+    python tools/replace_background.py product.jpg bg_reference.jpg out.jpg            # 위에서 본 사진
+    python tools/replace_background.py product.jpg bg_reference.jpg out.jpg --view side  # 옆모습(거울 반사)
 """
 import argparse
 
@@ -135,30 +136,128 @@ def remove_bottom_reflection(img_bgr, alpha, search=32, thr=185):
     return np.minimum(alpha, closed)
 
 
+def remove_mirror_reflection(img_bgr, alpha):
+    """옆에서 찍어 굽 아래로 제품이 거울처럼 비친 경우의 반사 제거.
+
+    hey,hye 제품은 굽 끝이 흰 무유(유약 없는) 띠이므로, 마스크 아래쪽에서
+    '밝고 채도 낮은 흰 띠'가 끝나는 지점을 열마다 찾고, 그 점들에
+    2차 곡선(굽 바닥 타원의 앞쪽 호)을 맞춰 그 아래를 모두 잘라낸다.
+    반환: (새 알파, 굽 바닥 타원 (cx, cy, a, b), 굽 좌우 x 범위)
+    """
+    o = img_bgr.astype(np.int32)
+    solid = alpha > 0.5
+    ys, xs = np.nonzero(solid)
+    top, bot = ys.min(), ys.max()
+    white = (o.min(2) > 170) & ((o.max(2) - o.min(2)) < 45)
+    pts = []
+    for x in range(xs.min(), xs.max() + 1, 2):
+        col = np.nonzero(solid[:, x])[0]
+        if not len(col):
+            continue
+        run = 0
+        for y in range(max(col.min(), bot - int(0.45 * (bot - top))), col.max() + 1):
+            if white[y, x]:
+                run += 1
+            else:
+                if run >= 4:
+                    pts.append((x, y))
+                    break
+                run = 0
+    pts = np.array(pts, np.float64)
+    if len(pts) < 20:
+        return alpha, None, None
+    # 이상치 제거하며 2차 곡선 맞추기
+    keep = np.ones(len(pts), bool)
+    for _ in range(3):
+        q = np.polyfit(pts[keep, 0], pts[keep, 1], 2)
+        r = np.abs(np.polyval(q, pts[:, 0]) - pts[:, 1])
+        keep = r < max(3.0, 2.5 * np.median(r[keep]))
+    h, w = alpha.shape
+    xc0 = -q[1] / (2 * q[0])
+    yb = float(np.polyval(q, xc0))  # 굽 바닥 앞쪽 가장 낮은 점
+    # 굽과 반사가 만나는 좌우 끝은 실루엣이 잘록해지는 지점(가장 좁은 줄)
+    rows = range(int(yb - 0.3 * (bot - top)), int(yb))
+    widths = []
+    for r in rows:
+        c = np.nonzero(solid[r])[0]
+        widths.append((c.max() - c.min(), r, c.min(), c.max()) if len(c) else (1e9, r, 0, 0))
+    _, yp, l, r = min(widths)
+    cx, ea, eb = (l + r) / 2, (r - l) / 2, max(yb - yp, 1.0)
+    # 굽 바닥 = 타원의 앞쪽 아래 호. 그 아래와 좌우 바깥(잘록점 아래)은 반사
+    xx = np.arange(w, dtype=np.float32)
+    t = np.clip((xx - cx) / ea, -1, 1)
+    curve = np.where(np.abs(xx - cx) <= ea, yp + eb * np.sqrt(1 - t * t), yp)
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    ramp = np.clip(curve[None, :] - yy + 0.5, 0, 1).astype(np.float32)
+    out = np.minimum(alpha, ramp)
+    xv = np.array([l, r], np.float32)
+    q = (cx, yp, ea, eb)  # 그림자용 굽 바닥 타원 정보
+    return out, q, (xv.min(), xv.max())
+
+
+def add_base_shadow(bg, alpha, foot, dx, dy):
+    """옆모습 제품용: 굽 바닥 타원(발자국)에서 만든 접지 그림자.
+
+    굽 바닥 타원 둘레로만 짧고 옅게 그림자를 깐다.
+    제품에 가려지는 부분은 자동으로 안 보인다.
+    """
+    h, w = alpha.shape
+    cx, cy, a, b = foot
+    cx, cy = cx + dx, cy + dy
+
+    def ell(scale_a, scale_b, sigma):
+        m = np.zeros((h, w), np.float32)
+        cv2.ellipse(m, (int(cx), int(cy)), (int(a * scale_a), int(b * scale_b)),
+                    0, 0, 360, 1.0, -1, cv2.LINE_AA)
+        return cv2.GaussianBlur(m, (0, 0), sigma)
+    contact = ell(1.04, 1.15, a * 0.03)
+    ambient = ell(1.45, 1.9, a * 0.14)
+    s = np.clip(contact * 0.75 + ambient * 0.35, 0, 0.7)
+    tint = np.array([0.55, 0.62, 0.70], np.float32)
+    return bg * (1 - s[..., None] * (1 - tint))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("product")
     p.add_argument("bg_reference")
     p.add_argument("output")
     p.add_argument("--mask-out", help="알파 마스크 저장 경로(선택)")
+    p.add_argument("--view", choices=["top", "side"], default="top",
+                   help="top: 위에서 내려다본 사진(얇은 반사 띠), "
+                        "side: 옆에서 찍어 굽 아래 거울 반사가 있는 사진")
     args = p.parse_args()
 
     img = cv2.imread(args.product)
     ref = cv2.imread(args.bg_reference)
     h, w = img.shape[:2]
 
-    alpha = remove_bottom_reflection(img, product_mask(img))
+    alpha = product_mask(img)
+    q = None
+    if args.view == "side":
+        alpha, q, foot_x = remove_mirror_reflection(img, alpha)
+    else:
+        alpha = remove_bottom_reflection(img, alpha)
 
     # 제품을 가로 중앙으로 평행이동만 한다(크기 변경/회전 없음 → 픽셀 재샘플링 없음)
     ys, xs = np.nonzero(alpha > 0.5)
     dx = int(round(w / 2 - (xs.min() + xs.max()) / 2))
-    dy = int(round(h * 0.86 - ys.max()))  # 바닥선을 캔버스 86% 높이에
+    if args.view == "side":
+        dy = int(round(h * 0.55 - (ys.min() + ys.max()) / 2))  # 세로 중앙보다 살짝 아래
+    else:
+        dy = int(round(h * 0.86 - ys.max()))  # 바닥선을 캔버스 86% 높이에
     M = np.float32([[1, 0, dx], [0, 1, dy]])
     img_t = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_NEAREST)
     alpha = cv2.warpAffine(alpha, M, (w, h), flags=cv2.INTER_NEAREST)
 
-    horizon = int(np.nonzero(alpha > 0.5)[0].min() - h * 0.06)  # 원본처럼 제품 뒤쪽에 벽-바닥 경계
-    bg = add_contact_shadow(make_background(ref, w, h, horizon), alpha)
+    ys, xs = np.nonzero(alpha > 0.5)
+    if args.view == "side" and q is not None:
+        # 원본 사진처럼 벽-바닥 경계가 제품 높이 중간쯤 뒤로 지나가게
+        horizon = int(ys.min() + 0.51 * (ys.max() - ys.min()))
+        bg = add_base_shadow(make_background(ref, w, h, horizon), alpha, q, dx, dy)
+    else:
+        horizon = int(ys.min() - h * 0.06)  # 위에서 본 사진: 제품 뒤쪽 위에 경계
+        bg = add_contact_shadow(make_background(ref, w, h, horizon), alpha)
     a = alpha[..., None]
     out = img_t.astype(np.float32) * a + bg * (1 - a)
     out = np.clip(np.rint(out), 0, 255).astype(np.uint8)
