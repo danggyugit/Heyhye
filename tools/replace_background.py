@@ -7,6 +7,9 @@
 사용법:
     python tools/replace_background.py product.jpg bg_reference.jpg out.jpg            # 위에서 본 사진
     python tools/replace_background.py product.jpg bg_reference.jpg out.jpg --view side  # 옆모습(거울 반사)
+    # 배경에 가격표·투명 아크릴 등 소품이 많을 때 (굽 아래 반사가 이미 분리되는 경우)
+    python tools/replace_background.py product.jpg bg_reference.jpg out.jpg --view side \\
+        --model ensemble --reflection none
 """
 import argparse
 
@@ -14,20 +17,58 @@ import cv2
 import numpy as np
 
 
-def product_mask(img_bgr):
-    """rembg(AI 분할)로 제품 알파 마스크를 만든다. 0~1 float."""
+def _rembg(img_bgr, model):
     from PIL import Image
     from rembg import new_session, remove
 
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    m = remove(Image.fromarray(rgb), session=new_session("isnet-general-use"),
-               only_mask=True)
-    a = np.asarray(m, dtype=np.float32) / 255.0
-    # 큰 덩어리 하나만 남겨 잡티 제거
+    m = remove(Image.fromarray(rgb), session=new_session(model), only_mask=True)
+    return np.asarray(m, dtype=np.float32) / 255.0
+
+
+def _clean(a):
+    """가장 큰 덩어리만 남기고, 붙어온 얇은 조각 제거, 작은 내부 구멍 메우기."""
+    a = a.copy()
     n, lab, stats, _ = cv2.connectedComponentsWithStats((a > 0.5).astype(np.uint8))
-    keep = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    region = cv2.dilate((lab == keep).astype(np.uint8), np.ones((5, 5), np.uint8))
-    a *= region
+    body = (lab == 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])).astype(np.uint8)
+    # 제품 옆에 붙어 딸려온 얇은 조각(투명 아크릴 가격표 등) 제거:
+    # 굵은 몸체만 남기는 opening 후, 원래 윤곽은 그 주변 몇 px 안에서만 유지
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    core = cv2.dilate(cv2.morphologyEx(body, cv2.MORPH_OPEN, k), np.ones((7, 7), np.uint8))
+    body &= core
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(body)
+    body = (lab == 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])).astype(np.uint8)
+    # 유광 제품의 밝은 반사광이 구멍으로 빠진 곳 메우기 (작은 내부 구멍만)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(1 - body)
+    for i in range(n):
+        x, y, bw, bh, area = stats[i]
+        touches = x == 0 or y == 0 or x + bw == body.shape[1] or y + bh == body.shape[0]
+        if not touches and area < 0.01 * body.sum():
+            body[lab == i] = 1
+            a[lab == i] = 1.0
+    a *= cv2.dilate(body, np.ones((5, 5), np.uint8))
+    return a, body
+
+
+def product_mask(img_bgr, model="isnet-general-use"):
+    """rembg(AI 분할)로 제품 알파 마스크를 만든다. 0~1 float.
+
+    model="ensemble": isnet 으로 '어느 덩어리가 제품인지'를 정하고(주변 소품과
+    잘 분리됨), 그 영역 안에서 birefnet 의 더 정확한 경계를 쓴다.
+    단 굽 부분은 두 결과의 합집합을 쓴다.
+    """
+    if model == "ensemble":
+        a_i, guide = _clean(_rembg(img_bgr, "isnet-general-use"))
+        guide = cv2.dilate(guide, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+        a, _ = _clean(_rembg(img_bgr, "birefnet-general") * guide)
+        # 굽(맨 아래 10%)은 바닥 반사와 헷갈려 birefnet 이 잘라먹는 경우가 있어
+        # 두 모델 결과를 합친다
+        ys = np.nonzero(a_i > 0.5)[0]
+        zone = int(ys.max() - 0.10 * (ys.max() - ys.min()))
+        a[zone:] = np.maximum(a[zone:], a_i[zone:])
+        a, _ = _clean(a)
+    else:
+        a, _ = _clean(_rembg(img_bgr, model))
     # 경계 바깥 1~2px만 부드럽게, 안쪽은 확실히 1.0 (제품 원본 유지)
     a[a > 0.92] = 1.0
     a[a < 0.04] = 0.0
@@ -195,6 +236,24 @@ def remove_mirror_reflection(img_bgr, alpha):
     return out, q, (xv.min(), xv.max())
 
 
+def foot_from_mask(alpha):
+    """반사 제거가 필요 없을 때: 마스크 아래 윤곽에서 굽 바닥 타원을 추정.
+
+    열마다 가장 아래 점을 구해, 맨 아래 근처(제품 높이의 6% 이내)에 있는
+    열들을 굽 바닥 호로 본다. 그 좌우 끝 = 타원 가로 끝, 호의 깊이 = 세로 반지름.
+    """
+    solid = alpha > 0.5
+    ys, xs = np.nonzero(solid)
+    top, bot = ys.min(), ys.max()
+    low = np.full(solid.shape[1], -1)
+    cols = np.nonzero(solid.any(0))[0]
+    low[cols] = solid.shape[0] - 1 - np.argmax(solid[::-1, cols], axis=0)
+    foot = np.nonzero(low >= bot - 0.06 * (bot - top))[0]
+    l, r = foot.min(), foot.max()
+    cy = (low[l] + low[r]) / 2
+    return ((l + r) / 2, cy, (r - l) / 2, max(bot - cy, 1.0))
+
+
 def add_base_shadow(bg, alpha, foot, dx, dy):
     """옆모습 제품용: 굽 바닥 타원(발자국)에서 만든 접지 그림자.
 
@@ -225,18 +284,27 @@ def main():
     p.add_argument("--mask-out", help="알파 마스크 저장 경로(선택)")
     p.add_argument("--view", choices=["top", "side"], default="top",
                    help="top: 위에서 내려다본 사진(얇은 반사 띠), "
-                        "side: 옆에서 찍어 굽 아래 거울 반사가 있는 사진")
+                        "side: 옆에서 찍은 사진")
+    p.add_argument("--model", default="isnet-general-use",
+                   help="rembg 분할 모델. 배경이 복잡하면(가격표·투명 아크릴 등) "
+                        "ensemble(isnet으로 제품 선택 + birefnet 경계)이 가장 정확함")
+    p.add_argument("--reflection", choices=["auto", "thin", "mirror", "none"], default="auto",
+                   help="바닥 반사 제거 방식. auto: top→thin, side→mirror. "
+                        "none: AI 마스크가 이미 굽 끝에서 정확히 끝날 때")
     args = p.parse_args()
 
     img = cv2.imread(args.product)
     ref = cv2.imread(args.bg_reference)
     h, w = img.shape[:2]
 
-    alpha = product_mask(img)
+    alpha = product_mask(img, args.model)
     q = None
-    if args.view == "side":
+    refl = args.reflection
+    if refl == "auto":
+        refl = "mirror" if args.view == "side" else "thin"
+    if refl == "mirror":
         alpha, q, foot_x = remove_mirror_reflection(img, alpha)
-    else:
+    elif refl == "thin":
         alpha = remove_bottom_reflection(img, alpha)
 
     # 제품을 가로 중앙으로 평행이동만 한다(크기 변경/회전 없음 → 픽셀 재샘플링 없음)
@@ -251,10 +319,15 @@ def main():
     alpha = cv2.warpAffine(alpha, M, (w, h), flags=cv2.INTER_NEAREST)
 
     ys, xs = np.nonzero(alpha > 0.5)
-    if args.view == "side" and q is not None:
+    if args.view == "side":
         # 원본 사진처럼 벽-바닥 경계가 제품 높이 중간쯤 뒤로 지나가게
         horizon = int(ys.min() + 0.51 * (ys.max() - ys.min()))
-        bg = add_base_shadow(make_background(ref, w, h, horizon), alpha, q, dx, dy)
+        if q is None:
+            q = foot_from_mask(alpha)
+            dx_, dy_ = 0, 0
+        else:
+            dx_, dy_ = dx, dy
+        bg = add_base_shadow(make_background(ref, w, h, horizon), alpha, q, dx_, dy_)
     else:
         horizon = int(ys.min() - h * 0.06)  # 위에서 본 사진: 제품 뒤쪽 위에 경계
         bg = add_contact_shadow(make_background(ref, w, h, horizon), alpha)
