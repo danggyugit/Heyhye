@@ -1,7 +1,8 @@
 """도자기 제품 사진의 배경 교체 스크립트.
 
 제품 픽셀은 일절 수정하지 않는다. 마스크 안쪽 픽셀은 원본 값을 그대로
-복사하고, 배경만 참고 이미지의 색감으로 새로 만든 뒤 바닥 그림자를 더한다.
+복사하고, 배경만 참고 이미지의 색감으로 새로 만든다. 바닥에 비친 반사 띠는
+마스크에서 제외한다.
 
 사용법:
     python tools/replace_background.py product.jpg bg_reference.jpg out.jpg
@@ -45,22 +46,51 @@ def make_background(ref_bgr, w, h):
     return bg
 
 
-def add_shadow(bg, alpha, strength=0.38):
-    """제품 바닥 접지 그림자 (부드러운 타원 + 진한 접촉선)."""
+def remove_bottom_reflection(img_bgr, alpha, search=32, thr=185):
+    """제품 아래 바닥(금속)에 비친 반사 띠를 마스크에서 잘라낸다.
+
+    각 열마다 마스크 바닥에서 위쪽 search px(반사 띠 두께 정도) 범위만 위→아래로 훑어,
+    밝은 유약면이 끝나고 어두운 반사 띠가 시작되는 지점을 찾아 그 아래를 제거.
+    제품 픽셀 값은 건드리지 않고 마스크만 줄인다.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray = cv2.GaussianBlur(gray, (0, 0), 1.0)
     h, w = alpha.shape
-    ys, xs = np.nonzero(alpha > 0.5)
-    bottom, left, right = ys.max(), xs.min(), xs.max()
-    cx, rw = (left + right) / 2, (right - left) / 2
-    sh = np.zeros((h, w), np.float32)
-    cv2.ellipse(sh, (int(cx), int(bottom - rw * 0.06)),
-                (int(rw * 0.80), int(rw * 0.07)), 0, 0, 360, 1.0, -1)
-    soft = cv2.GaussianBlur(sh, (0, 0), rw * 0.07) * 0.8
-    cv2.ellipse(sh, (int(cx), int(bottom - rw * 0.02)),
-                (int(rw * 0.70), int(rw * 0.025)), 0, 0, 360, 1.0, -1)
-    contact = cv2.GaussianBlur(sh, (0, 0), rw * 0.025)
-    s = np.clip(soft + contact * 0.9, 0, 1) * strength
-    tint = np.array([0.80, 0.86, 0.92], np.float32)  # 따뜻한 갈색 톤 그림자 (BGR)
-    return bg * (1 - s[..., None] * (1 - tint * 0.6))
+    solid = alpha > 0.5
+    xs = np.nonzero(solid.any(0))[0]
+    cut = np.full(w, -1.0)
+    for x in xs:
+        ys = np.nonzero(solid[:, x])[0]
+        top, bot = ys.min(), ys.max()
+        for y in range(max(top, bot - search), bot + 1):
+            if gray[y, x] < thr and gray[min(y + 3, h - 1), x] < thr:
+                cut[x] = y
+                break
+        else:
+            cut[x] = bot + 1
+    # 바닥 윤곽이 완만한 구간(실제 바닥 테두리)에서만 자른다.
+    # 옆면처럼 가파른 열에서는 자르지 않아 계단이 생기지 않게 한다.
+    bots = np.array([np.nonzero(solid[:, x])[0].max() if solid[:, x].any() else -1
+                     for x in range(w)], np.float32)
+    slope = np.abs(np.gradient(bots))
+    valid = cut >= 0
+    steep = valid & (cv2.blur(slope.reshape(1, -1), (15, 1)).ravel() > 1.2)
+    cut[steep] = bots[steep] + 1
+    # 잘라낼 두께(깊이)를 매끈하게 → 윤곽 모양은 원본을 따르고 전환부 계단 방지
+    depth = np.where(valid, bots + 1 - cut, 0).astype(np.float32)
+    k = 15
+    pad = np.pad(depth, k, mode="edge")
+    depth = np.array([np.median(pad[i:i + 2 * k + 1]) for i in range(w)])
+    depth = np.convolve(np.pad(depth, 20, mode="edge"), np.ones(41) / 41, "valid")
+    c = (bots + 1 - depth)[valid]
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    ramp = np.clip(c[None, :] - yy, 0, 1)  # 컷 경계 1px 안티앨리어싱
+    out = alpha.copy()
+    out[:, valid] = np.minimum(alpha[:, valid], ramp)
+    # 옆면 가파른 구간에서 생기는 계단/홈을 메운다 (원본 마스크 범위 안에서만)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (61, 61))
+    closed = cv2.morphologyEx(out, cv2.MORPH_CLOSE, k)
+    return np.minimum(alpha, closed)
 
 
 def main():
@@ -75,7 +105,7 @@ def main():
     ref = cv2.imread(args.bg_reference)
     h, w = img.shape[:2]
 
-    alpha = product_mask(img)
+    alpha = remove_bottom_reflection(img, product_mask(img))
 
     # 제품을 가로 중앙으로 평행이동만 한다(크기 변경/회전 없음 → 픽셀 재샘플링 없음)
     ys, xs = np.nonzero(alpha > 0.5)
@@ -85,7 +115,7 @@ def main():
     img_t = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_NEAREST)
     alpha = cv2.warpAffine(alpha, M, (w, h), flags=cv2.INTER_NEAREST)
 
-    bg = add_shadow(make_background(ref, w, h), alpha)
+    bg = make_background(ref, w, h)
     a = alpha[..., None]
     out = img_t.astype(np.float32) * a + bg * (1 - a)
     out = np.clip(np.rint(out), 0, 255).astype(np.uint8)
