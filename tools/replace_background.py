@@ -10,6 +10,9 @@
     # 배경에 가격표·투명 아크릴 등 소품이 많고, 어두운 유광 몸체 아래 굽이 비친 경우
     python tools/replace_background.py product.jpg bg_reference.jpg out.jpg --view side \\
         --model ensemble --reflection rim
+    # 식물 등 얇은 잎이 포함된 연출 사진 (birefnet 단독은 반사도 잘 분리함)
+    python tools/replace_background.py product.jpg bg_reference.jpg out.jpg --view side \\
+        --model birefnet-general --reflection none
 """
 import argparse
 
@@ -26,8 +29,13 @@ def _rembg(img_bgr, model):
     return np.asarray(m, dtype=np.float32) / 255.0
 
 
-def _clean(a):
-    """가장 큰 덩어리만 남기고, 붙어온 얇은 조각 제거, 작은 내부 구멍 메우기."""
+def _clean(a, cut_thin=True):
+    """가장 큰 덩어리만 남기고, 붙어온 얇은 조각 제거, 작은 내부 구멍 메우기.
+
+    cut_thin=False 면 얇은 조각 제거와 구멍 메우기를 건너뛴다. 식물 잎처럼
+    얇은 부분이나 잎 사이로 보이는 배경이 있는 경우. birefnet 은 아크릴을
+    애초에 잘 빼고 유광 반사광에 구멍도 거의 내지 않아 불필요.
+    """
     a = a.copy()
     n, lab, stats, _ = cv2.connectedComponentsWithStats((a > 0.5).astype(np.uint8))
     body = (lab == 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])).astype(np.uint8)
@@ -35,7 +43,8 @@ def _clean(a):
     # 굵은 몸체만 남기는 opening 후, 원래 윤곽은 그 주변 몇 px 안에서만 유지
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
     core = cv2.dilate(cv2.morphologyEx(body, cv2.MORPH_OPEN, k), np.ones((7, 7), np.uint8))
-    body &= core
+    if cut_thin:
+        body &= core
     n, lab, stats, _ = cv2.connectedComponentsWithStats(body)
     body = (lab == 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])).astype(np.uint8)
     # 유광 제품의 밝은 반사광이 구멍으로 빠진 곳 메우기 (작은 내부 구멍만)
@@ -43,7 +52,7 @@ def _clean(a):
     for i in range(n):
         x, y, bw, bh, area = stats[i]
         touches = x == 0 or y == 0 or x + bw == body.shape[1] or y + bh == body.shape[0]
-        if not touches and area < 0.01 * body.sum():
+        if cut_thin and not touches and area < 0.01 * body.sum():
             body[lab == i] = 1
             a[lab == i] = 1.0
     a *= cv2.dilate(body, np.ones((5, 5), np.uint8))
@@ -61,7 +70,7 @@ def product_mask(img_bgr, model="isnet-general-use"):
         guide = cv2.dilate(guide, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
         a, _ = _clean(_rembg(img_bgr, "birefnet-general") * guide)
     else:
-        a, _ = _clean(_rembg(img_bgr, model))
+        a, _ = _clean(_rembg(img_bgr, model), cut_thin=not model.startswith("birefnet"))
     # 경계 바깥 1~2px만 부드럽게, 안쪽은 확실히 1.0 (제품 원본 유지)
     a[a > 0.92] = 1.0
     a[a < 0.04] = 0.0
