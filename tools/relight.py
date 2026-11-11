@@ -11,7 +11,9 @@ replace_background.py 결과(합성 이미지)와 마스크를 받아:
     python tools/relight.py comp.jpg mask.png out.jpg [--steps 20] [--prompt "..."]
 
 모델: lllyasviel/ic-light (iclight_sd15_fbc.safetensors) +
-      stablediffusionapi/realistic-vision-v51 (SD1.5). CPU 로도 동작(한 장 수 분).
+      stablediffusionapi/realistic-vision-v51 (SD1.5). CPU 4코어 기준 한 장 약 1~2분
+      (첫 실행은 모델 약 4GB 다운로드). 제품·배경 경계는 마스크로 나눠 따로 계산해
+      후광이 생기지 않는다.
 """
 import argparse
 
@@ -45,8 +47,8 @@ def load_models():
     sched = DPMSolverMultistepScheduler(num_train_timesteps=1000, beta_start=0.00085,
                                         beta_end=0.012, algorithm_type="sde-dpmsolver++",
                                         use_karras_sigmas=True, steps_offset=1)
-    for m in (te, vae, unet):
-        m.eval()
+    for m in (te, vae, unet):  # 일부 가중치가 fp16 으로 저장돼 있어 CPU 용 fp32 로 통일
+        m.float().eval()
     return tok, te, vae, unet, sched
 
 
@@ -121,12 +123,25 @@ def main():
         cv2.imwrite(args.lowres_out, relit)
 
     # 조명 변화 비율만 고해상도에 적용 (디테일은 원본 유지)
+    # 제품 안쪽과 배경을 따로 흐려서(마스크 정규화 블러) 경계에 후광이 생기지 않게
     k = max(w, h) / 64
-    def lowfreq(x):
-        return cv2.GaussianBlur(x.astype(np.float32) + 1, (0, 0), k)
-    gain = np.clip(lowfreq(relit) / lowfreq(small), 0.55, 1.6)
-    gain = 1 + (gain - 1) * args.strength
-    gain = cv2.resize(gain, (W, H), interpolation=cv2.INTER_CUBIC)
+    m = (am[..., 0] > 0.5).astype(np.float32)
+
+    def lowfreq(x, mm):
+        num = cv2.GaussianBlur(x.astype(np.float32) + 1, (0, 0), k) if mm is None else \
+            cv2.GaussianBlur((x.astype(np.float32) + 1) * mm[..., None], (0, 0), k)
+        den = 1.0 if mm is None else cv2.GaussianBlur(mm, (0, 0), k)[..., None] + 1e-4
+        return num / den
+    def ratio(mm):
+        r = lowfreq(relit, mm) / lowfreq(small, mm)
+        cover = cv2.GaussianBlur(mm, (0, 0), k)[..., None]
+        return np.where(cover > 1e-3, np.nan_to_num(r, nan=1.0), 1.0)
+    g_fg, g_bg = ratio(m), ratio(1 - m)
+    gain = np.clip(g_fg * m[..., None] + g_bg * (1 - m[..., None]), 0.55, 1.6)
+    gfg = cv2.resize(np.clip(g_fg, 0.55, 1.6), (W, H), interpolation=cv2.INTER_CUBIC)
+    gbg = cv2.resize(np.clip(g_bg, 0.55, 1.6), (W, H), interpolation=cv2.INTER_CUBIC)
+    A = a[..., None]
+    gain = 1 + ((gfg * A + gbg * (1 - A)) - 1) * args.strength
     out = np.clip(comp.astype(np.float32) * gain, 0, 255).astype(np.uint8)
     cv2.imwrite(args.output, out, [cv2.IMWRITE_JPEG_QUALITY, 97])
 

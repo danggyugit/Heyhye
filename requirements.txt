@@ -2,3 +2,9 @@ opencv-python-headless
 numpy
 rembg[cpu]
 pillow
+# tools/relight.py (AI 재조명, 선택)
+torch
+diffusers
+transformers
+accelerate
+safetensors
