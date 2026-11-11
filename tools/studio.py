@@ -241,7 +241,7 @@ def choose_backdrop(alpha):
     return "split" if ratio >= 0.45 else "sweep"
 
 
-def shadows(alpha, light_x, strength=1.0):
+def shadows(alpha, light_x, strength=1.0, cast=1.0):
     """그림자 농도 맵(0~1). 세 겹:
 
     1) 접지 그림자: 굽이 바닥에 닿는 선 바로 주변, 짧고 진하게 (붙어 있는 느낌의 핵심)
@@ -277,22 +277,70 @@ def shadows(alpha, light_x, strength=1.0):
 
     # 드리운 그림자: 높이 hgt 인 점을 (뒤로) sy*hgt 만큼, (옆으로) shear*hgt 만큼 이동
     dirx = -np.sign(light_x) if abs(light_x) > 0.08 else 0.0
-    shear = 0.55 * min(abs(light_x) * 1.6, 1.0) * dirx
-    sy = 0.22
+    # cast>1 이면 그림자가 더 길고(옆·뒤로) 진해진다
+    shear = 0.55 * min(abs(light_x) * 1.6, 1.0) * dirx * (1 + 0.6 * (cast - 1))
+    sy = 0.22 * (1 + 0.5 * (cast - 1))
     M = np.float32([[1, -shear, shear * bot], [0, sy, (1 - sy) * bot]])
     proj = cv2.warpAffine((alpha > 0.5).astype(np.float32), M, (w, h), flags=cv2.INTER_LINEAR)
     dist = np.clip((bot - yy) / (sy * H + 1), 0, 1)       # 0: 굽 근처 → 1: 그림자 끝
     blurs = [cv2.GaussianBlur(proj, (0, 0), s) for s in (a * 0.05, a * 0.11, a * 0.22)]
     k = dist * 2
-    cast = np.where(k < 1, blurs[0] * (1 - k) + blurs[1] * k,
-                    blurs[1] * (2 - k) + blurs[2] * (k - 1))
-    cast *= (1 - dist) ** 1.3
+    cast_map = np.where(k < 1, blurs[0] * (1 - k) + blurs[1] * k,
+                        blurs[1] * (2 - k) + blurs[2] * (k - 1))
+    cast_map *= (1 - dist) ** 1.3
 
-    s = contact * 0.55 + near * 0.30 + ambient * 0.15 + cast * 0.24
+    # 위에서 오는 빛에 의한 몸통 그늘: 제품 최대 폭만큼 넓은 타원을 굽 위치 바닥에 깔고
+    # 크게 흐리게 (몸통이 테이블을 가리는 만큼 어두워짐 — 떠 보임을 없애는 핵심)
+    maxw = max(np.ptp(np.nonzero(sil[r])[0]) for r in range(ys.min(), bot + 1, 4)
+               if sil[r].any()) / 2
+    pr = b / max(a, 1)                            # 원근(바닥 타원의 납작함)
+    body = np.zeros((h, w), np.float32)
+    cv2.ellipse(body, (int(round(cx)), int(round(cy))),
+                (max(int(maxw * 0.9), 1), max(int(maxw * 0.9 * pr), 1)), 0, 0, 360, 1.0, -1,
+                cv2.LINE_AA)
+    body = cv2.GaussianBlur(body, (0, 0), maxw * 0.22)
+
+    s = (contact * 0.55 + near * 0.30 * cast ** 0.5 + ambient * 0.15 * cast
+         + cast_map * 0.24 * cast + body * 0.22 * (cast - 1))
     return np.clip(s * strength, 0, 0.8)
 
 
-def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, style="auto"):
+def reflection(img_t, alpha, strength=0.12, length=0.28):
+    """반광택 테이블에 비친 제품 (배경에만 그림).
+
+    열마다 실제 바닥 윤곽(가장 아래 점)을 기준으로 제품을 위아래로 뒤집어
+    그 아래에 놓고, 멀어질수록 옅고 흐리게 한다. 반환: (반사 이미지, 농도 맵)
+    """
+    h, w = alpha.shape
+    solid = alpha > 0.5
+    ys = np.nonzero(solid)[0]
+    top, bot = ys.min(), ys.max()
+    L = max(length * (bot - top), 1.0)
+    low = np.full(w, -1, np.float32)
+    cols = np.nonzero(solid.any(0))[0]
+    low[cols] = h - 1 - np.argmax(solid[::-1, cols], axis=0)
+    # 거울면 = 테이블 면: 굽이 닿는 열은 실제 바닥 윤곽, 그 바깥(몸통 옆면)은 굽 바닥 높이.
+    # 옆면 윤곽을 기준으로 뒤집으면 몸통 옆에 줄무늬가 생기므로 쓰지 않는다
+    cx, cy, a, b, _ = footprint(alpha)
+    xx = np.arange(w, dtype=np.float32)
+    in_foot = (np.abs(xx - cx) <= a) & (low >= cy - 2)
+    low = np.where(in_foot, low, cy).astype(np.float32)
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    map_y = (2 * low[None, :] - yy).astype(np.float32)
+    map_x = np.repeat(np.arange(w, dtype=np.float32)[None, :], h, 0)
+    refl = cv2.remap(img_t, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    ra = cv2.remap(alpha.astype(np.float32), map_x, map_y, cv2.INTER_LINEAR,
+                   borderMode=cv2.BORDER_CONSTANT)
+    d = np.clip((yy - low[None, :]) / L, 0, 1)
+    ra = ra * (yy > low[None, :]) * (1 - d) ** 2 * strength
+    # 테이블 결 때문에 비친 모습은 살짝 흐리게
+    refl = cv2.GaussianBlur(refl.astype(np.float32), (0, 0), 2.5)
+    ra = cv2.GaussianBlur(ra, (0, 0), 1.5)
+    return refl, ra
+
+
+def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, style="auto",
+           cast=1.0, reflect=0.0):
     """배경 생성 + 그림자 + 합성. alpha==1 인 제품 픽셀은 원본 그대로.
 
     style: "split"(벽·바닥 경계), "sweep"(경계 없는 스튜디오), "auto"(제품 비율로 선택)
@@ -308,10 +356,13 @@ def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, styl
         bg = backdrop_split(w, h, wall_bgr, floor_bgr, seam_y(alpha), bot, light_x)
     else:
         bg = backdrop(w, h, wall_bgr, floor_bgr, bot, light_x)
-    s = shadows(alpha, light_x, shadow_strength)[..., None]
+    s = shadows(alpha, light_x, shadow_strength, cast)[..., None]
     # 그림자 색: 바닥색을 어둡고 약간 진하게 (회색이 아닌 같은 톤의 그늘)
     shade = np.asarray(floor_bgr, np.float32) * 0.42
     bg = bg * (1 - s) + shade * s
+    if reflect > 0:
+        refl, ra = reflection(img_t, alpha, reflect)
+        bg = bg * (1 - ra[..., None]) + refl * ra[..., None]
     a = alpha[..., None]
     out = img_t.astype(np.float32) * a + bg * (1 - a)
     out = np.clip(np.rint(out), 0, 255).astype(np.uint8)
