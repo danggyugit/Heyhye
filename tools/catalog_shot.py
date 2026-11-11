@@ -1,6 +1,6 @@
 """도자기 제품 카탈로그 사진 만들기 — 제품은 그대로, 배경·바닥·접지 그림자만.
 
-우선순위: 제품 보존 > 자연스러운 접지 그림자 > 배경의 자연스러움
+목표: 제품이 바닥에 안정적으로 놓인 자연스러운 스튜디오 사진
 
   1) rembg 로 제품 마스크 (+ 바닥 반사 제거: replace_background.py 와 같은 옵션)
   2) 제품을 평행이동만 해서 배치 — 크기·회전 변경 없음, 출력 해상도 = 원본 해상도
@@ -13,7 +13,9 @@
      - 드리운 그림자: 빛 반대쪽으로 길게 눕는 타원형 그라디언트, 멀어질수록
        더 흐리고 옅어짐(조명 방향은 제품 하이라이트로 자동 추정 또는 지정)
      그림자 색은 회색이 아니라 바닥색을 따뜻하게 어둡게 한 색
-  5) 제품 완전 불투명 영역은 원본 픽셀을 그대로 복사하고, 저장 후 다시 읽어 검증
+  5) 제품 어울림(기본): 색 끼임 제거, 제품 하단 AO, 바닥 반사광, 라이트 랩, 윤곽 완화.
+     형태·크기는 그대로(평행이동만). --keep-product 를 주면 제품 픽셀을 원본 그대로
+     복사하고 저장 후 다시 읽어 변경 0개인지 검증한다
 
 사용법:
     python tools/catalog_shot.py samples/wave_side_original.jpg --out-dir samples/catalog \\
@@ -62,8 +64,8 @@ def build_parser():
     g = p.add_argument_group("그림자")
     g.add_argument("--light", default="auto", choices=["auto", "left", "right", "front"],
                    help="빛이 오는 방향 (auto: 제품 하이라이트로 추정)")
-    g.add_argument("--contact-strength", type=float, default=0.6)
-    g.add_argument("--contact-size", type=float, default=0.07,
+    g.add_argument("--contact-strength", type=float, default=0.7)
+    g.add_argument("--contact-size", type=float, default=0.09,
                    help="접촉 그림자가 밑면에서 퍼지는 폭(굽 반지름 대비)")
     g.add_argument("--ao-strength", type=float, default=0.32)
     g.add_argument("--ao-size", type=float, default=0.5,
@@ -76,8 +78,24 @@ def build_parser():
     g.add_argument("--opacity", type=float, default=1.0, help="그림자 전체 투명도 배율")
     g.add_argument("--shadow-tint", default="0.56,0.61,0.68",
                    help="그림자 색 = 바닥색 × 이 값 (B,G,R; 파랑을 더 줄이면 따뜻한 그늘)")
-    g.add_argument("--reflect", type=float, default=0.0,
-                   help="바닥 반사 세기 (0=없음, 아주 약하게라면 0.04~0.06)")
+    g = p.add_argument_group("제품 어울림 (제품 픽셀을 조금 바꿈. --keep-product 로 끔)")
+    g.add_argument("--keep-product", action="store_true",
+                   help="제품 픽셀을 원본 그대로 유지(아래 보정 전부 끔, 픽셀 검증 수행)")
+    g.add_argument("--product-ao", type=float, default=0.22,
+                   help="제품 아랫부분이 바닥 가까이에서 어두워지는 정도")
+    g.add_argument("--product-ao-height", type=float, default=0.12,
+                   help="제품 아래쪽 어두워지는 범위(제품 높이 대비)")
+    g.add_argument("--bounce", type=float, default=0.10,
+                   help="바닥에서 반사된 따뜻한 빛이 제품 아래쪽에 비치는 정도")
+    g.add_argument("--neutralize", type=float, default=0.6,
+                   help="원본 촬영 환경(철판·창가)의 푸른/녹색 끼를 덜어내는 정도 0~1")
+    g.add_argument("--wrap", type=float, default=0.35,
+                   help="배경 빛이 제품 가장자리로 번지는 라이트 랩 세기")
+    g.add_argument("--edge-soft", type=float, default=0.8,
+                   help="제품 윤곽 부드럽게(픽셀). 오려 붙인 듯한 딱딱한 경계 완화")
+    g = p.add_argument_group("반사")
+    g.add_argument("--reflect", type=float, default=0.05,
+                   help="바닥 반사 세기 (기본 0.05 = 아주 약하게, 0=없음)")
     return p
 
 
@@ -153,6 +171,62 @@ def shadow_map(alpha, light_x, P):
     return s
 
 
+# ------------------------------------------------------------------ 제품 어울림
+
+def harmonize_product(img_t, alpha, bg, floor_bgr, P):
+    """제품이 이 바닥 위, 이 조명 아래에 실제로 놓여 있는 것처럼 제품 쪽을 조정.
+
+    1) 색 끼임 제거: 무채색(흰·회색) 부분의 평균 색을 배경의 중성색 쪽으로 옮김
+    2) 제품 하단 AO: 바닥에 가까울수록 어둡게 (실제 물체는 바닥 근처가 어둡다)
+    3) 바닥 반사광: 바닥의 따뜻한 색이 제품 아래쪽에 은은하게 비침
+    4) 라이트 랩: 배경의 밝은 빛이 제품 가장자리로 살짝 번짐
+    5) 윤곽을 아주 살짝 부드럽게 (alpha 가장자리만)
+    """
+    h, w = alpha.shape
+    prod = img_t.astype(np.float32)
+    m = alpha > 0.02
+    ys, xs = np.nonzero(alpha > 0.5)
+    top, bot = ys.min(), ys.max()
+    H = bot - top
+    yy = np.arange(h, dtype=np.float32)[:, None]
+
+    # 1) 색 끼임 제거 (Lab a·b 평균 이동, 무채색 픽셀 기준)
+    lab = cv2.cvtColor(np.clip(prod, 0, 255).astype(np.uint8), cv2.COLOR_BGR2Lab).astype(np.float32)
+    C = np.hypot(lab[..., 1] - 128, lab[..., 2] - 128)
+    neutral = m & (C < 14) & (lab[..., 0] > 120)
+    if neutral.sum() > 500 and P.neutralize > 0:
+        tgt = cv2.cvtColor(np.uint8([[floor_bgr]]), cv2.COLOR_BGR2Lab)[0, 0].astype(np.float32)
+        shift = (np.array([128 + (tgt[1] - 128) * 0.5, 128 + (tgt[2] - 128) * 0.5])
+                 - np.array([np.median(lab[..., 1][neutral]), np.median(lab[..., 2][neutral])]))
+        lab[..., 1] += shift[0] * P.neutralize
+        lab[..., 2] += shift[1] * P.neutralize
+        prod = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_Lab2BGR).astype(np.float32)
+
+    # 2) 제품 하단 AO + 3) 바닥 반사광 (아래 가장자리에서의 거리 기준)
+    low = np.full(w, -1, np.float32)
+    cols = np.nonzero((alpha > 0.5).any(0))[0]
+    low[cols] = h - 1 - np.argmax((alpha > 0.5)[::-1, cols], axis=0)
+    up = np.where(low[None, :] >= 0, low[None, :] - yy, 1e9)          # 바닥선 위로 몇 px
+    band = max(P.product_ao_height * H, 4)
+    near = np.clip(1 - up / band, 0, 1) ** 1.8 * m
+    prod = prod * (1 - P.product_ao * near[..., None])
+    glow = np.clip(1 - up / (band * 1.8), 0, 1) ** 1.2 * m
+    prod = prod + (np.asarray(floor_bgr, np.float32) - prod) * (P.bounce * glow)[..., None] * 0.5
+
+    # 4) 라이트 랩
+    a = alpha.astype(np.float32)
+    r = max(H * 0.006, 1.5)
+    inner = np.clip(cv2.GaussianBlur(1 - a, (0, 0), r * 2) * a * 2.0, 0, 1)
+    bgb = cv2.GaussianBlur(bg, (0, 0), r * 3)
+    prod = prod * (1 - (inner * P.wrap)[..., None]) + bgb * (inner * P.wrap)[..., None]
+
+    # 5) 윤곽 부드럽게
+    if P.edge_soft > 0:
+        a = np.minimum(a, cv2.GaussianBlur(a, (0, 0), P.edge_soft) + (a >= 1) * 0)
+        a = cv2.GaussianBlur(a, (0, 0), P.edge_soft)
+    return np.clip(prod, 0, 255), a
+
+
 # ------------------------------------------------------------------ 메인
 
 def main():
@@ -196,13 +270,20 @@ def main():
     tint = np.array([float(v) for v in P.shadow_tint.split(",")], np.float32)
     bg = bg * (1 - s * (1 - tint))                                   # 곱하기 합성
     if P.reflect > 0:
-        refl, ra = studio.reflection(img_t, alpha, P.reflect)
+        # 반광택 바닥에 아주 약하게, 짧게, 흐릿하게 비치도록
+        refl, ra = studio.reflection(img_t, alpha, P.reflect, length=0.18)
+        refl = cv2.GaussianBlur(refl, (0, 0), 4)
         bg = bg * (1 - ra[..., None]) + refl * ra[..., None]
 
-    A = alpha[..., None]
-    out = np.clip(np.rint(img_t.astype(np.float32) * A + bg * (1 - A)), 0, 255).astype(np.uint8)
     inside = alpha >= 1.0
-    out[inside] = img_t[inside]                                      # 제품 원본 픽셀 그대로
+    if P.keep_product:
+        prod, comp_a = img_t.astype(np.float32), alpha
+    else:
+        prod, comp_a = harmonize_product(img_t, alpha, bg, studio.parse_hex(P.floor), P)
+    A = comp_a[..., None]
+    out = np.clip(np.rint(prod * A + bg * (1 - A)), 0, 255).astype(np.uint8)
+    if P.keep_product:
+        out[inside] = img_t[inside]                                  # 제품 원본 픽셀 그대로
 
     before = os.path.join(P.out_dir, f"{name}_before.jpg")
     after = os.path.join(P.out_dir, f"{name}_after.png")
@@ -216,12 +297,16 @@ def main():
     # 검증: 저장한 파일을 다시 읽어 제품 영역이 원본과 같은지
     chk = cv2.imread(after)
     Y, X = np.nonzero(inside)
-    same = (chk[Y, X] == img[Y - dy, X - dx]).all(1)
+    diff = np.abs(chk[Y, X].astype(int) - img[Y - dy, X - dx].astype(int)).max(1)
     assert chk.shape == img.shape, "해상도가 원본과 다름"
-    print(f"{name}: {w}x{h} (원본과 동일), 빛 방향 {'오른쪽' if light_x > 0.08 else '왼쪽' if light_x < -0.08 else '정면'}, "
-          f"제품 픽셀 {len(Y):,}개 중 변경 {int((~same).sum())}개")
-    if not same.all():
-        raise SystemExit("제품 픽셀이 바뀌었습니다")
+    light = '오른쪽' if light_x > 0.08 else '왼쪽' if light_x < -0.08 else '정면'
+    if P.keep_product:
+        print(f"{name}: {w}x{h} (원본과 동일), 빛 {light}, 제품 픽셀 {len(Y):,}개 중 변경 {int((diff > 0).sum())}개")
+        if (diff > 0).any():
+            raise SystemExit("제품 픽셀이 바뀌었습니다")
+    else:  # 제품 어울림 보정: 얼마나 바뀌었는지 보고 (형태는 평행이동만, 크기·윤곽 동일)
+        print(f"{name}: {w}x{h} (원본과 동일), 빛 {light}, 제품 픽셀 평균 변화 {diff.mean():.1f}/255, "
+              f"10 이상 바뀐 픽셀 {100 * (diff >= 10).mean():.1f}%")
 
 
 if __name__ == "__main__":
