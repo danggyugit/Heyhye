@@ -16,6 +16,11 @@
     python tools/replace_background.py product.jpg out.jpg --model ensemble --reflection rim
     # 식물 등 얇은 잎이 포함된 연출 사진
     python tools/replace_background.py product.jpg out.jpg --model birefnet-general --reflection none
+    # 옆모습: 얇은 흰 굽 선 바로 아래 어두운 접지선 + 반사
+    python tools/replace_background.py product.jpg out.jpg --model birefnet-general --reflection crease
+
+    # 한 제품의 여러 각도 사진을 세트로: 배경색·캔버스 크기 통일
+    python tools/replace_background.py a.jpg a_out.jpg --bg "#EDE0D2" --canvas 1628x2171
 
     # 배경색 후보 비교 이미지도 함께 저장 / 특정 후보·색 지정
     python tools/replace_background.py product.jpg out.jpg --palette-sheet sheet.jpg
@@ -141,7 +146,7 @@ def remove_mirror_reflection(img_bgr, alpha):
     """옆에서 찍어 굽 아래로 제품이 거울처럼 비친 경우의 반사 제거.
 
     hey,hye 제품은 굽 끝이 흰 무유(유약 없는) 띠이므로, 마스크 아래쪽에서
-    '밝고 채도 낮은 흰 띠'가 끝나는 지점을 열마다 찾고, 그 점들에
+    '밝고 채도 낮은 흰 띠' 중 가장 아래 것이 끝나는 지점을 열마다 찾고, 그 점들에
     2차 곡선(굽 바닥 타원의 앞쪽 호)을 맞춰 그 아래를 모두 잘라낸다.
     반환: (새 알파, 굽 바닥 타원 (cx, cy, a, b), 굽 좌우 x 범위)
     """
@@ -155,15 +160,17 @@ def remove_mirror_reflection(img_bgr, alpha):
         col = np.nonzero(solid[:, x])[0]
         if not len(col):
             continue
-        run = 0
+        # 흰 띠 중 '가장 아래' 것이 굽 끝 (위쪽의 밝은 유약면을 흰 띠로 오인하지 않게)
+        run, last = 0, None
         for y in range(max(col.min(), bot - int(0.45 * (bot - top))), col.max() + 1):
             if white[y, x]:
                 run += 1
             else:
                 if run >= 4:
-                    pts.append((x, y))
-                    break
+                    last = y
                 run = 0
+        if last is not None:
+            pts.append((x, last))
     pts = np.array(pts, np.float64)
     if len(pts) < 20:
         return alpha, None, None
@@ -239,19 +246,82 @@ def remove_rim_reflection(img_bgr, alpha, line_px=7):
     return np.minimum(alpha, np.clip(cut[None, :] - yy + 0.5, 0, 1).astype(np.float32))
 
 
-def place(img, alpha, h, w):
+def remove_crease_reflection(img_bgr, alpha, zone=0.12):
+    """옆모습: 흰 굽 선 → 어두운 접지선 → (반사) 순서로 보이는 경우의 반사 제거.
+
+    열마다 마스크 맨 아래에서 위로 올라가며, '바로 위가 밝은 흰 선(굽 끝)이고
+    자신은 어두운' 접지선을 찾는다. 그 점들에 매끈한 곡선을 맞춰 접지선부터
+    아래(바닥에 비친 굽·몸체)를 잘라낸다. 흰 선이 얇아도(3px~) 동작한다.
+    """
+    g = cv2.GaussianBlur(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32),
+                         (0, 0), 0.8)
+    solid = alpha > 0.5
+    ys, xs = np.nonzero(solid)
+    top, bot = ys.min(), ys.max()
+    lim = int(bot - zone * (bot - top))
+    X, T = [], []
+    for x in range(xs.min(), xs.max() + 1):
+        col = np.nonzero(solid[:, x])[0]
+        if not len(col) or col.max() < lim:
+            continue
+        for y in range(col.max(), max(lim, col.min() + 10), -1):
+            above = g[y - 9:y - 1, x]
+            if above.max() > 170 and above.max() - g[y, x] > 45 and g[y, x] <= g[y - 1:y + 2, x].min():
+                X.append(x)
+                T.append(y - 1)
+                break
+    if len(X) < 20:
+        return alpha
+    X, T = np.array(X, float), np.array(T, float)
+    keep = np.ones(len(X), bool)
+    for _ in range(5):
+        p = np.polyfit(X[keep], T[keep], 4)
+        r = np.abs(T - np.polyval(p, X))
+        keep = r < max(2.5, 2.5 * np.median(r[keep]))
+    h, w = alpha.shape
+    xx = np.arange(w, dtype=np.float64)
+    # 굽 바닥은 타원 → 앞쪽 호의 점들로 타원을 맞추면 양 끝(위로 휘는 부분)까지 정확
+    pts = np.stack([X[keep], T[keep]], 1).astype(np.float32)
+    (ecx, ecy), (d1, d2), ang = cv2.fitEllipse(pts)
+    ea, eb = max(d1, d2) / 2, min(d1, d2) / 2
+    if abs(((ang + 90) % 180) - 90) < 15 or abs(((ang) % 180) - 90) < 15:
+        # 축이 거의 수평/수직인 타원만 사용: 아래 호 y = cy + b·sqrt(1-((x-cx)/a)^2)
+        t = np.clip((xx - ecx) / ea, -1, 1)
+        inside = np.abs(xx - ecx) <= ea
+        # 타원 끝 바로 바깥(18px)은 끝 높이로 잘라 반사 조각을 없애고,
+        # 그보다 바깥은 몸통이므로 자르지 않는다
+        edge = (np.abs(xx - ecx) > ea) & (np.abs(xx - ecx) <= ea + 18)
+        cut = np.where(inside, ecy + eb * np.sqrt(1 - t * t), np.where(edge, ecy, 1e9))
+    else:
+        xl, xr = X[keep].min(), X[keep].max()
+        cut = np.polyval(p, np.clip(xx, xl, xr))
+    yy = np.arange(h, dtype=np.float64)[:, None]
+    out = np.minimum(alpha, np.clip(cut[None, :] - yy + 0.5, 0, 1).astype(np.float32))
+    # 컷 곡선과 옆 윤곽이 만나는 곳의 작은 홈 메우기 (원래 마스크 범위 안에서만)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    return np.minimum(alpha, np.maximum(out, cv2.morphologyEx(out, cv2.MORPH_CLOSE, k)))
+
+
+def place(img, alpha, h, w, max_w=0.76, max_h=0.74, canvas=None):
     """제품을 평행이동만 해서(크기·회전 변경 없음 → 픽셀 재샘플링 없음) 배치.
 
-    가로 중앙, 바닥 닿는 선을 캔버스 80% 높이에. 키가 커서 위가 잘리면 내린다.
+    가로 중앙, 바닥 닿는 선을 캔버스 80% 높이에. 제품이 커서 여백이 부족하면
+    제품을 줄이는 대신 캔버스를 같은 비율로 넓힌다(제품 폭 ≤ 76%, 높이 ≤ 74%).
+    반환: (배치된 이미지, 알파) — 캔버스 크기는 원본보다 클 수 있음
     """
     ys, xs = np.nonzero(alpha > 0.5)
-    dx = int(round(w / 2 - (xs.min() + xs.max()) / 2))
-    dy = int(round(h * 0.80 - ys.max()))
-    if ys.min() + dy < h * 0.06:
-        dy = int(round(h * 0.06 - ys.min()))
+    bw, bh = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
+    k = max(1.0, bw / (max_w * w), bh / (max_h * h))
+    W, H = int(np.ceil(w * k)), int(np.ceil(h * k))
+    if canvas:  # 세트 사진 크기 통일용 고정 캔버스 (필요하면 그보다 크게)
+        W, H = max(W, canvas[0]), max(H, canvas[1])
+    dx = int(round(W / 2 - (xs.min() + xs.max()) / 2))
+    dy = int(round(H * 0.80 - ys.max()))
+    if ys.min() + dy < H * 0.06:
+        dy = int(round(H * 0.06 - ys.min()))
     M = np.float32([[1, 0, dx], [0, 1, dy]])
-    return (cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_NEAREST),
-            cv2.warpAffine(alpha, M, (w, h), flags=cv2.INTER_NEAREST))
+    return (cv2.warpAffine(img, M, (W, H), flags=cv2.INTER_NEAREST),
+            cv2.warpAffine(alpha, M, (W, H), flags=cv2.INTER_NEAREST))
 
 
 def main():
@@ -264,6 +334,7 @@ def main():
                         "reference(--bg-ref 이미지 색) | 1,2,3..(추천 순위) | #RRGGBB")
     p.add_argument("--bg-ref", help="배경 색감 참고 이미지(선택). 주면 후보에 '참고 배경'이 추가됨")
     p.add_argument("--palette-sheet", help="배경색 후보별 결과를 나란히 놓은 비교 이미지 저장 경로")
+    p.add_argument("--canvas", help="출력 크기 고정 WxH (예: 1628x2171). 세트 사진 크기 통일용")
     p.add_argument("--shadow", type=float, default=1.0, help="그림자 진하기 배율 (기본 1.0)")
     p.add_argument("--mask-out", help="알파 마스크 저장 경로(선택)")
     p.add_argument("--view", choices=["top", "side"], default="top",
@@ -273,9 +344,10 @@ def main():
                    help="rembg 분할 모델. 배경이 복잡하면(가격표·투명 아크릴 등) "
                         "ensemble(isnet으로 제품 선택 + birefnet 경계)이 가장 정확함. "
                         "식물 등 얇은 잎이 있으면 birefnet-general")
-    p.add_argument("--reflection", choices=["auto", "thin", "mirror", "rim", "none"], default="auto",
+    p.add_argument("--reflection", choices=["auto", "thin", "mirror", "rim", "crease", "none"], default="auto",
                    help="바닥 반사 제거 방식. auto: top→thin, side→mirror. "
                         "rim: 어두운 유광 몸체 아래 밝은 굽 반사(은색 테두리만 남김). "
+                        "crease: 얇은 흰 굽 선 바로 아래 어두운 접지선이 보이는 옆모습. "
                         "none: AI 마스크가 이미 굽 끝에서 정확히 끝날 때")
     args = p.parse_args()
 
@@ -293,8 +365,11 @@ def main():
         alpha = remove_bottom_reflection(img, alpha)
     elif refl == "rim":
         alpha = remove_rim_reflection(img, alpha)
+    elif refl == "crease":
+        alpha = remove_crease_reflection(img, alpha)
 
-    img_t, alpha = place(img, alpha, h, w)
+    canvas = tuple(int(v) for v in args.canvas.lower().split("x")) if args.canvas else None
+    img_t, alpha = place(img, alpha, h, w, canvas=canvas)
     light_x = studio.light_direction(img_t, alpha)
     cands = studio.recommend_backgrounds(img_t, alpha, ref)
 
@@ -305,7 +380,8 @@ def main():
     if args.bg.startswith("#"):
         wall = studio.parse_hex(args.bg)
         lab = studio.bgr_to_lab(wall)[0]
-        floor = studio.lab_to_bgr(lab - np.array([6, 0, 0], np.float32))[0]
+        # 추천 후보와 같은 규칙: 바닥은 명도 −6, 채도 ×1.25
+        floor = studio.lab_to_bgr(np.array([lab[0] - 6, lab[1] * 1.25, lab[2] * 1.25], np.float32))[0]
         chosen = dict(label_ko="직접 지정", wall=wall, floor=floor)
     elif args.bg == "auto":
         chosen = cands[0]

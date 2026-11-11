@@ -74,7 +74,8 @@ def recommend_backgrounds(img_bgr, alpha, ref_bgr=None):
     accent = None
     if main is not None:
         for i in np.argsort(-score):
-            if i != main and score[i] > 0 and C[i] > 15 and \
+            # 어두운 색(예: 진녹색 줄무늬)은 Lab 채도가 낮게 나오므로 기준을 낮추고 면적도 본다
+            if i != main and score[i] > 0 and C[i] > 7 and w[i] >= 0.10 and \
                     min(abs(H[i] - H[main]), 360 - abs(H[i] - H[main])) > 35:
                 accent = int(i)
                 break
