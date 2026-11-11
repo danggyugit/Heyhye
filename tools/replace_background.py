@@ -7,9 +7,9 @@
 사용법:
     python tools/replace_background.py product.jpg bg_reference.jpg out.jpg            # 위에서 본 사진
     python tools/replace_background.py product.jpg bg_reference.jpg out.jpg --view side  # 옆모습(거울 반사)
-    # 배경에 가격표·투명 아크릴 등 소품이 많을 때 (굽 아래 반사가 이미 분리되는 경우)
+    # 배경에 가격표·투명 아크릴 등 소품이 많고, 어두운 유광 몸체 아래 굽이 비친 경우
     python tools/replace_background.py product.jpg bg_reference.jpg out.jpg --view side \\
-        --model ensemble --reflection none
+        --model ensemble --reflection rim
 """
 import argparse
 
@@ -55,18 +55,11 @@ def product_mask(img_bgr, model="isnet-general-use"):
 
     model="ensemble": isnet 으로 '어느 덩어리가 제품인지'를 정하고(주변 소품과
     잘 분리됨), 그 영역 안에서 birefnet 의 더 정확한 경계를 쓴다.
-    단 굽 부분은 두 결과의 합집합을 쓴다.
     """
     if model == "ensemble":
         a_i, guide = _clean(_rembg(img_bgr, "isnet-general-use"))
         guide = cv2.dilate(guide, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
         a, _ = _clean(_rembg(img_bgr, "birefnet-general") * guide)
-        # 굽(맨 아래 10%)은 바닥 반사와 헷갈려 birefnet 이 잘라먹는 경우가 있어
-        # 두 모델 결과를 합친다
-        ys = np.nonzero(a_i > 0.5)[0]
-        zone = int(ys.max() - 0.10 * (ys.max() - ys.min()))
-        a[zone:] = np.maximum(a[zone:], a_i[zone:])
-        a, _ = _clean(a)
     else:
         a, _ = _clean(_rembg(img_bgr, model))
     # 경계 바깥 1~2px만 부드럽게, 안쪽은 확실히 1.0 (제품 원본 유지)
@@ -236,6 +229,49 @@ def remove_mirror_reflection(img_bgr, alpha):
     return out, q, (xv.min(), xv.max())
 
 
+def remove_rim_reflection(img_bgr, alpha, line_px=7):
+    """유광(검정 등 어두운) 몸체 아래로 굽이 밝게 비친 경우의 반사 제거.
+
+    열마다 마스크 맨 아래에서 위로 올라가며 밝은 반사 띠를 지나
+    어두운 유약면이 나오는 지점을 찾고, 그 점들에 매끈한 곡선을 맞춘다.
+    가운데는 몸체 아래 얇은 은색 테두리(실제 굽 끝, line_px)를 남기고
+    좌우로 갈수록 0 으로 줄여, 그 아래 밝은 띠(반사)는 모두 잘라낸다.
+    """
+    g = cv2.GaussianBlur(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32),
+                         (0, 0), 1.5)
+    solid = alpha > 0.5
+    ys, xs = np.nonzero(solid)
+    top, bot = ys.min(), ys.max()
+    lim = int(bot - 0.15 * (bot - top))
+    X, T = [], []
+    for x in range(xs.min(), xs.max() + 1):
+        col = np.nonzero(solid[:, x])[0]
+        if not len(col):
+            continue
+        b = y = col.max()
+        while y > max(lim, col.min()) and not (g[y - 3:y + 1, x] < 80).all():
+            y -= 1
+        if b - (y + 1) > 6:  # 밝은 띠가 있는 열만
+            X.append(x)
+            T.append(y + 1)
+    if len(X) < 20:
+        return alpha
+    X, T = np.array(X, float), np.array(T, float)
+    keep = np.ones(len(X), bool)
+    for _ in range(5):  # 유광 하이라이트로 튄 점 제거하며 4차 곡선 맞추기
+        p = np.polyfit(X[keep], T[keep], 4)
+        r = np.abs(T - np.polyval(p, X))
+        keep = r < max(3.0, 2.5 * np.median(r[keep]))
+    h, w = alpha.shape
+    xl, xr = X.min(), X.max()
+    xc, hw = (xl + xr) / 2, (xr - xl) / 2
+    xx = np.arange(w, dtype=np.float64)
+    thick = line_px * np.clip(1 - (np.abs(xx - xc) / hw) ** 4, 0, 1)
+    cut = np.where((xx >= xl) & (xx <= xr), np.polyval(p, xx) + thick, 1e9)
+    yy = np.arange(h, dtype=np.float64)[:, None]
+    return np.minimum(alpha, np.clip(cut[None, :] - yy + 0.5, 0, 1).astype(np.float32))
+
+
 def foot_from_mask(alpha):
     """반사 제거가 필요 없을 때: 마스크 아래 윤곽에서 굽 바닥 타원을 추정.
 
@@ -288,8 +324,9 @@ def main():
     p.add_argument("--model", default="isnet-general-use",
                    help="rembg 분할 모델. 배경이 복잡하면(가격표·투명 아크릴 등) "
                         "ensemble(isnet으로 제품 선택 + birefnet 경계)이 가장 정확함")
-    p.add_argument("--reflection", choices=["auto", "thin", "mirror", "none"], default="auto",
+    p.add_argument("--reflection", choices=["auto", "thin", "mirror", "rim", "none"], default="auto",
                    help="바닥 반사 제거 방식. auto: top→thin, side→mirror. "
+                        "rim: 어두운 유광 몸체 아래 밝은 굽 반사(은색 테두리만 남김). "
                         "none: AI 마스크가 이미 굽 끝에서 정확히 끝날 때")
     args = p.parse_args()
 
@@ -306,6 +343,8 @@ def main():
         alpha, q, foot_x = remove_mirror_reflection(img, alpha)
     elif refl == "thin":
         alpha = remove_bottom_reflection(img, alpha)
+    elif refl == "rim":
+        alpha = remove_rim_reflection(img, alpha)
 
     # 제품을 가로 중앙으로 평행이동만 한다(크기 변경/회전 없음 → 픽셀 재샘플링 없음)
     ys, xs = np.nonzero(alpha > 0.5)
