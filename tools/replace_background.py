@@ -4,8 +4,8 @@
   → 스튜디오 배경 + 빛 방향에 맞춘 그림자 → 합성
 
 제품 픽셀은 일절 수정하지 않는다(마스크 안쪽은 원본 값을 그대로 복사).
-배경색은 제품 색을 분석해 어울리는 후보(톤온톤·보색·포인트·뉴트럴)를
-추천하고, 기본으로 1순위를 쓴다.
+배경색은 기본으로 아이보리(#F2EADE)를 쓴다. 제품 색을 분석한 추천 후보
+(톤온톤·보색·포인트·뉴트럴)도 출력하며 --bg auto 등으로 고를 수 있다.
 
 사용법:
     # 위에서 본 사진 (얇은 반사 띠)
@@ -22,8 +22,8 @@
     # 배경 형태: 높이가 있는 제품은 자동으로 벽·테이블(split), 접시 등 납작하면 경계 없는 배경(sweep)
     python tools/replace_background.py product.jpg out.jpg --backdrop sweep
 
-    # 한 제품의 여러 각도 사진을 세트로: 배경색·캔버스 크기 통일
-    python tools/replace_background.py a.jpg a_out.jpg --bg "#EDE0D2" --canvas 1628x2171
+    # 한 제품의 여러 각도 사진을 세트로: 캔버스 크기 통일
+    python tools/replace_background.py a.jpg a_out.jpg --canvas 1628x2171
 
     # 배경색 후보 비교 이미지도 함께 저장 / 특정 후보·색 지정
     python tools/replace_background.py product.jpg out.jpg --palette-sheet sheet.jpg
@@ -305,6 +305,11 @@ def remove_crease_reflection(img_bgr, alpha, zone=0.12):
     return np.minimum(alpha, np.maximum(out, cv2.morphologyEx(out, cv2.MORPH_CLOSE, k)))
 
 
+# 기본 배경: 따뜻한 아이보리. 제품과 비슷한 색 배경은 제품이 묻혀 보여서
+# 모든 제품에 같은 중립 밝은 색을 쓴다.
+IVORY = "#F2EADE"
+
+
 def place(img, alpha, h, w, max_w=0.76, max_h=0.74, canvas=None):
     """제품을 평행이동만 해서(크기·회전 변경 없음 → 픽셀 재샘플링 없음) 배치.
 
@@ -332,9 +337,10 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("product")
     p.add_argument("output")
-    p.add_argument("--bg", default="auto",
-                   help="배경색. auto(추천 1순위) | tonal | complement | accent | neutral | "
-                        "reference(--bg-ref 이미지 색) | 1,2,3..(추천 순위) | #RRGGBB")
+    p.add_argument("--bg", default="ivory",
+                   help="배경색. ivory(기본, #F2EADE) | auto(제품 색 기반 추천 1순위) | tonal | "
+                        "complement | accent | neutral | reference(--bg-ref 이미지 색) | "
+                        "1,2,3..(추천 순위) | #RRGGBB")
     p.add_argument("--bg-ref", help="배경 색감 참고 이미지(선택). 주면 후보에 '참고 배경'이 추가됨")
     p.add_argument("--palette-sheet", help="배경색 후보별 결과를 나란히 놓은 비교 이미지 저장 경로")
     p.add_argument("--canvas", help="출력 크기 고정 WxH (예: 1628x2171). 세트 사진 크기 통일용")
@@ -383,18 +389,19 @@ def main():
     for i, c in enumerate(cands):
         print(f"  {i + 1}. {c['label_ko']:6s} {studio.hex_of(c['wall'])}  --bg {c['name']:10s} {c['note']}")
 
-    if args.bg.startswith("#"):
-        wall = studio.parse_hex(args.bg)
+    bg = IVORY if args.bg == "ivory" else args.bg
+    if bg.startswith("#"):
+        wall = studio.parse_hex(bg)
         lab = studio.bgr_to_lab(wall)[0]
         # 추천 후보와 같은 규칙: 바닥은 명도 −6, 채도 ×1.25
         floor = studio.lab_to_bgr(np.array([lab[0] - 6, lab[1] * 1.25, lab[2] * 1.25], np.float32))[0]
-        chosen = dict(label_ko="직접 지정", wall=wall, floor=floor)
-    elif args.bg == "auto":
+        chosen = dict(label_ko="아이보리" if args.bg == "ivory" else "직접 지정", wall=wall, floor=floor)
+    elif bg == "auto":
         chosen = cands[0]
-    elif args.bg.isdigit():
-        chosen = cands[min(int(args.bg), len(cands)) - 1]
+    elif bg.isdigit():
+        chosen = cands[min(int(bg), len(cands)) - 1]
     else:
-        match = [c for c in cands if c["name"] == args.bg]
+        match = [c for c in cands if c["name"] == bg]
         if not match:
             p.error(f"--bg {args.bg}: 이 사진의 후보에 없음 ({', '.join(c['name'] for c in cands)})")
         chosen = match[0]
