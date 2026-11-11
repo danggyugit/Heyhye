@@ -1,23 +1,36 @@
-"""도자기 제품 사진의 배경 교체 스크립트.
+"""도자기 제품 사진 자동 보정 파이프라인.
 
-제품 픽셀은 일절 수정하지 않는다. 마스크 안쪽 픽셀은 원본 값을 그대로
-복사하고, 배경만 참고 이미지의 색감으로 새로 만든다. 바닥에 비친 반사 띠는
-마스크에서 제외하고, 제품 실루엣으로 만든 자연스러운 접지 그림자를 더한다.
+  원본 사진 → rembg 제품 분리 → 바닥 반사 제거 → 배경색 추천
+  → 스튜디오 배경 + 빛 방향에 맞춘 그림자 → 합성
+
+제품 픽셀은 일절 수정하지 않는다(마스크 안쪽은 원본 값을 그대로 복사).
+배경색은 제품 색을 분석해 어울리는 후보(톤온톤·보색·포인트·뉴트럴)를
+추천하고, 기본으로 1순위를 쓴다.
 
 사용법:
-    python tools/replace_background.py product.jpg bg_reference.jpg out.jpg            # 위에서 본 사진
-    python tools/replace_background.py product.jpg bg_reference.jpg out.jpg --view side  # 옆모습(거울 반사)
-    # 배경에 가격표·투명 아크릴 등 소품이 많고, 어두운 유광 몸체 아래 굽이 비친 경우
-    python tools/replace_background.py product.jpg bg_reference.jpg out.jpg --view side \\
-        --model ensemble --reflection rim
-    # 식물 등 얇은 잎이 포함된 연출 사진 (birefnet 단독은 반사도 잘 분리함)
-    python tools/replace_background.py product.jpg bg_reference.jpg out.jpg --view side \\
-        --model birefnet-general --reflection none
+    # 위에서 본 사진 (얇은 반사 띠)
+    python tools/replace_background.py product.jpg out.jpg
+    # 옆모습, 흰 굽 아래 거울 반사
+    python tools/replace_background.py product.jpg out.jpg --view side
+    # 가격표·아크릴 등 소품이 많고, 어두운 유광 몸체 아래 굽이 비친 경우
+    python tools/replace_background.py product.jpg out.jpg --model ensemble --reflection rim
+    # 식물 등 얇은 잎이 포함된 연출 사진
+    python tools/replace_background.py product.jpg out.jpg --model birefnet-general --reflection none
+
+    # 배경색 후보 비교 이미지도 함께 저장 / 특정 후보·색 지정
+    python tools/replace_background.py product.jpg out.jpg --palette-sheet sheet.jpg
+    python tools/replace_background.py product.jpg out.jpg --bg complement
+    python tools/replace_background.py product.jpg out.jpg --bg "#E8E2D1"
 """
 import argparse
+import os
+import sys
 
 import cv2
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import studio  # noqa: E402
 
 
 def _rembg(img_bgr, model):
@@ -75,61 +88,6 @@ def product_mask(img_bgr, model="isnet-general-use"):
     a[a > 0.92] = 1.0
     a[a < 0.04] = 0.0
     return a
-
-
-def make_background(ref_bgr, w, h, horizon):
-    """참고 배경 색감으로 '벽 + 바닥' 스튜디오 배경을 만든다.
-
-    원본 사진과 같은 원근(벽과 바닥이 만나는 선)을 유지해야 제품이
-    바닥 위에 놓인 것처럼 보인다.
-    """
-    rh = ref_bgr.shape[0]
-    ref = ref_bgr.astype(np.float32)
-    wall = np.median(ref[: int(rh * 0.5)].reshape(-1, 3), 0)
-    floor_far = np.median(ref[int(rh * 0.83): int(rh * 0.88)].reshape(-1, 3), 0)
-    floor_near = np.median(ref[int(rh * 0.95):].reshape(-1, 3), 0)
-    y = np.arange(h, dtype=np.float32)
-    t = np.clip((y - horizon) / (h - horizon), 0, 1)[:, None]
-    floor = floor_far * (1 - t) + floor_near * t
-    wall_col = wall * (1 + 0.015 * (1 - y / max(horizon, 1)))[:, None]  # 위로 갈수록 살짝 밝게
-    s = np.clip((y - horizon) / (h * 0.03) + 0.5, 0, 1)[:, None]          # 벽-바닥 경계 부드럽게
-    s = s * s * (3 - 2 * s)
-    col = wall_col * (1 - s) + floor * s
-    bg = np.repeat(col[:, None, :], w, axis=1)
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    d = np.sqrt(((xx - w / 2) / (w / 2)) ** 2 + ((yy - h * 0.6) / (h / 2)) ** 2)
-    bg *= (1.0 - 0.06 * np.clip(d - 0.35, 0, 1))[..., None]               # 은은한 비네팅
-    rng = np.random.default_rng(0)
-    bg += rng.normal(0, 1.2, (h, w, 1)).astype(np.float32)               # 밴딩 방지 그레인
-    return bg
-
-
-def add_contact_shadow(bg, alpha):
-    """제품 바닥 테두리를 따라가는 접지 그림자.
-
-    임의의 타원 대신 제품 실루엣을 아래로 몇 px 내린 뒤 블러해서,
-    바닥 곡선 바로 아래에만 얇게 생기는 그림자를 만든다.
-    옆면 쪽으로는 점점 사라지게 해서 옆으로 튀어나오지 않는다.
-    """
-    h, w = alpha.shape
-    ys, xs = np.nonzero(alpha > 0.5)
-    bot = ys.max()
-    rw = (xs.max() - xs.min()) / 2
-
-    def drop(px, sigma):
-        M = np.float32([[1, 0, 0], [0, 1, px]])
-        sh = cv2.warpAffine(alpha, M, (w, h), flags=cv2.INTER_LINEAR)
-        return cv2.GaussianBlur(sh, (0, 0), sigma)
-
-    contact = drop(rw * 0.008, rw * 0.008)   # 테두리에 딱 붙은 짙은 선
-    ambient = drop(rw * 0.045, rw * 0.06)    # 그 아래 옅게 퍼지는 그늘
-    # 바닥에 가까운 높이에서만 그림자가 생기도록 (옆면 위쪽은 0)
-    yy = np.arange(h, dtype=np.float32)[:, None]
-    band = rw * 0.35
-    weight = np.clip((yy - (bot - band)) / band, 0, 1) ** 1.5
-    s = np.clip((contact * 0.70 + ambient * 0.42) * weight, 0, 0.6)
-    tint = np.array([0.55, 0.62, 0.70], np.float32)  # 배경과 같은 따뜻한 톤 (BGR 곱)
-    return bg * (1 - s[..., None] * (1 - tint))
 
 
 def remove_bottom_reflection(img_bgr, alpha, search=32, thr=185):
@@ -281,58 +239,40 @@ def remove_rim_reflection(img_bgr, alpha, line_px=7):
     return np.minimum(alpha, np.clip(cut[None, :] - yy + 0.5, 0, 1).astype(np.float32))
 
 
-def foot_from_mask(alpha):
-    """반사 제거가 필요 없을 때: 마스크 아래 윤곽에서 굽 바닥 타원을 추정.
+def place(img, alpha, h, w):
+    """제품을 평행이동만 해서(크기·회전 변경 없음 → 픽셀 재샘플링 없음) 배치.
 
-    열마다 가장 아래 점을 구해, 맨 아래 근처(제품 높이의 6% 이내)에 있는
-    열들을 굽 바닥 호로 본다. 그 좌우 끝 = 타원 가로 끝, 호의 깊이 = 세로 반지름.
+    가로 중앙, 바닥 닿는 선을 캔버스 80% 높이에. 키가 커서 위가 잘리면 내린다.
     """
-    solid = alpha > 0.5
-    ys, xs = np.nonzero(solid)
-    top, bot = ys.min(), ys.max()
-    low = np.full(solid.shape[1], -1)
-    cols = np.nonzero(solid.any(0))[0]
-    low[cols] = solid.shape[0] - 1 - np.argmax(solid[::-1, cols], axis=0)
-    foot = np.nonzero(low >= bot - 0.06 * (bot - top))[0]
-    l, r = foot.min(), foot.max()
-    cy = (low[l] + low[r]) / 2
-    return ((l + r) / 2, cy, (r - l) / 2, max(bot - cy, 1.0))
-
-
-def add_base_shadow(bg, alpha, foot, dx, dy):
-    """옆모습 제품용: 굽 바닥 타원(발자국)에서 만든 접지 그림자.
-
-    굽 바닥 타원 둘레로만 짧고 옅게 그림자를 깐다.
-    제품에 가려지는 부분은 자동으로 안 보인다.
-    """
-    h, w = alpha.shape
-    cx, cy, a, b = foot
-    cx, cy = cx + dx, cy + dy
-
-    def ell(scale_a, scale_b, sigma):
-        m = np.zeros((h, w), np.float32)
-        cv2.ellipse(m, (int(cx), int(cy)), (int(a * scale_a), int(b * scale_b)),
-                    0, 0, 360, 1.0, -1, cv2.LINE_AA)
-        return cv2.GaussianBlur(m, (0, 0), sigma)
-    contact = ell(1.04, 1.15, a * 0.03)
-    ambient = ell(1.45, 1.9, a * 0.14)
-    s = np.clip(contact * 0.75 + ambient * 0.35, 0, 0.7)
-    tint = np.array([0.55, 0.62, 0.70], np.float32)
-    return bg * (1 - s[..., None] * (1 - tint))
+    ys, xs = np.nonzero(alpha > 0.5)
+    dx = int(round(w / 2 - (xs.min() + xs.max()) / 2))
+    dy = int(round(h * 0.80 - ys.max()))
+    if ys.min() + dy < h * 0.06:
+        dy = int(round(h * 0.06 - ys.min()))
+    M = np.float32([[1, 0, dx], [0, 1, dy]])
+    return (cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_NEAREST),
+            cv2.warpAffine(alpha, M, (w, h), flags=cv2.INTER_NEAREST))
 
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("product")
-    p.add_argument("bg_reference")
     p.add_argument("output")
+    p.add_argument("--bg", default="auto",
+                   help="배경색. auto(추천 1순위) | tonal | complement | accent | neutral | "
+                        "reference(--bg-ref 이미지 색) | 1,2,3..(추천 순위) | #RRGGBB")
+    p.add_argument("--bg-ref", help="배경 색감 참고 이미지(선택). 주면 후보에 '참고 배경'이 추가됨")
+    p.add_argument("--palette-sheet", help="배경색 후보별 결과를 나란히 놓은 비교 이미지 저장 경로")
+    p.add_argument("--shadow", type=float, default=1.0, help="그림자 진하기 배율 (기본 1.0)")
     p.add_argument("--mask-out", help="알파 마스크 저장 경로(선택)")
     p.add_argument("--view", choices=["top", "side"], default="top",
-                   help="top: 위에서 내려다본 사진(얇은 반사 띠), "
-                        "side: 옆에서 찍은 사진")
+                   help="top: 위에서 내려다본 사진, side: 옆에서 찍은 사진 "
+                        "(--reflection auto 일 때 반사 제거 방식 선택에만 쓰임)")
     p.add_argument("--model", default="isnet-general-use",
                    help="rembg 분할 모델. 배경이 복잡하면(가격표·투명 아크릴 등) "
-                        "ensemble(isnet으로 제품 선택 + birefnet 경계)이 가장 정확함")
+                        "ensemble(isnet으로 제품 선택 + birefnet 경계)이 가장 정확함. "
+                        "식물 등 얇은 잎이 있으면 birefnet-general")
     p.add_argument("--reflection", choices=["auto", "thin", "mirror", "rim", "none"], default="auto",
                    help="바닥 반사 제거 방식. auto: top→thin, side→mirror. "
                         "rim: 어두운 유광 몸체 아래 밝은 굽 반사(은색 테두리만 남김). "
@@ -340,53 +280,50 @@ def main():
     args = p.parse_args()
 
     img = cv2.imread(args.product)
-    ref = cv2.imread(args.bg_reference)
+    ref = cv2.imread(args.bg_ref) if args.bg_ref else None
     h, w = img.shape[:2]
 
     alpha = product_mask(img, args.model)
-    q = None
     refl = args.reflection
     if refl == "auto":
         refl = "mirror" if args.view == "side" else "thin"
     if refl == "mirror":
-        alpha, q, foot_x = remove_mirror_reflection(img, alpha)
+        alpha, _, _ = remove_mirror_reflection(img, alpha)
     elif refl == "thin":
         alpha = remove_bottom_reflection(img, alpha)
     elif refl == "rim":
         alpha = remove_rim_reflection(img, alpha)
 
-    # 제품을 가로 중앙으로 평행이동만 한다(크기 변경/회전 없음 → 픽셀 재샘플링 없음)
-    ys, xs = np.nonzero(alpha > 0.5)
-    dx = int(round(w / 2 - (xs.min() + xs.max()) / 2))
-    if args.view == "side":
-        dy = int(round(h * 0.55 - (ys.min() + ys.max()) / 2))  # 세로 중앙보다 살짝 아래
-    else:
-        dy = int(round(h * 0.86 - ys.max()))  # 바닥선을 캔버스 86% 높이에
-    M = np.float32([[1, 0, dx], [0, 1, dy]])
-    img_t = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_NEAREST)
-    alpha = cv2.warpAffine(alpha, M, (w, h), flags=cv2.INTER_NEAREST)
+    img_t, alpha = place(img, alpha, h, w)
+    light_x = studio.light_direction(img_t, alpha)
+    cands = studio.recommend_backgrounds(img_t, alpha, ref)
 
-    ys, xs = np.nonzero(alpha > 0.5)
-    if args.view == "side":
-        # 원본 사진처럼 벽-바닥 경계가 제품 높이 중간쯤 뒤로 지나가게
-        horizon = int(ys.min() + 0.51 * (ys.max() - ys.min()))
-        if q is None:
-            q = foot_from_mask(alpha)
-            dx_, dy_ = 0, 0
-        else:
-            dx_, dy_ = dx, dy
-        bg = add_base_shadow(make_background(ref, w, h, horizon), alpha, q, dx_, dy_)
-    else:
-        horizon = int(ys.min() - h * 0.06)  # 위에서 본 사진: 제품 뒤쪽 위에 경계
-        bg = add_contact_shadow(make_background(ref, w, h, horizon), alpha)
-    a = alpha[..., None]
-    out = img_t.astype(np.float32) * a + bg * (1 - a)
-    out = np.clip(np.rint(out), 0, 255).astype(np.uint8)
-    # 마스크 안쪽은 원본 값을 그대로 덮어써서 1비트도 바뀌지 않게 보장
-    inside = alpha >= 1.0
-    out[inside] = img_t[inside]
+    print("배경색 추천:")
+    for i, c in enumerate(cands):
+        print(f"  {i + 1}. {c['label_ko']:6s} {studio.hex_of(c['wall'])}  --bg {c['name']:10s} {c['note']}")
 
+    if args.bg.startswith("#"):
+        wall = studio.parse_hex(args.bg)
+        lab = studio.bgr_to_lab(wall)[0]
+        floor = studio.lab_to_bgr(lab - np.array([6, 0, 0], np.float32))[0]
+        chosen = dict(label_ko="직접 지정", wall=wall, floor=floor)
+    elif args.bg == "auto":
+        chosen = cands[0]
+    elif args.bg.isdigit():
+        chosen = cands[min(int(args.bg), len(cands)) - 1]
+    else:
+        match = [c for c in cands if c["name"] == args.bg]
+        if not match:
+            p.error(f"--bg {args.bg}: 이 사진의 후보에 없음 ({', '.join(c['name'] for c in cands)})")
+        chosen = match[0]
+    print(f"사용: {chosen['label_ko']} {studio.hex_of(chosen['wall'])}")
+
+    out = studio.render(img_t, alpha, chosen["wall"], chosen["floor"], light_x, args.shadow)
     cv2.imwrite(args.output, out, [cv2.IMWRITE_JPEG_QUALITY, 97])
+    if args.palette_sheet:
+        renders = [studio.render(img_t, alpha, c["wall"], c["floor"], light_x, args.shadow)
+                   for c in cands]
+        studio.palette_sheet(renders, cands, args.palette_sheet)
     if args.mask_out:
         cv2.imwrite(args.mask_out, (alpha * 255).astype(np.uint8))
 
