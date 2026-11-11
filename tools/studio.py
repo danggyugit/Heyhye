@@ -377,43 +377,137 @@ def reflection(img_t, alpha, strength=0.12, length=0.28):
     return refl, ra
 
 
+def grade_product(img_bgr, alpha, wall_bgr, sat=1.25, wb=0.6, contrast=1.05):
+    """제품 색 보정 (마스크 안쪽만).
+
+    1) 색 끼임 보정: 철판·창가 빛 때문에 제품의 흰/회색 부분(무채색)에 낀
+       푸른 기를 배경(아이보리) 쪽 따뜻한 중성색으로 wb 비율만큼 옮긴다
+    2) 바이브런스: 채도가 낮은 색일수록 더 많이 올려 선명하게(이미 진한 색은 덜)
+    3) 약한 대비
+    """
+    m = alpha > 0
+    lab = cv2.cvtColor(img_bgr.astype(np.float32) / 255.0, cv2.COLOR_BGR2Lab)
+    L, A, B = lab[..., 0], lab[..., 1], lab[..., 2]
+    C = np.hypot(A, B)
+    neutral = m & (C < 12) & (L > 50)
+    if neutral.sum() > 500:
+        tgt = bgr_to_lab(wall_bgr)[0][1:] * 0.5
+        cast = np.array([np.median(A[neutral]), np.median(B[neutral])])
+        shift = (tgt - cast) * wb
+        A = A + shift[0]
+        B = B + shift[1]
+        C = np.hypot(A, B)
+    k = 1 + (sat - 1) * np.clip(1 - C / 70, 0.35, 1)
+    A, B = A * k, B * k
+    L = np.clip(50 + (L - 50) * contrast, 0, 100)
+    out = cv2.cvtColor(np.dstack([L, A, B]).astype(np.float32), cv2.COLOR_Lab2BGR)
+    out = np.clip(out * 255, 0, 255)
+    res = img_bgr.astype(np.float32).copy()
+    res[m] = out[m]
+    return res
+
+
+def unify_light(out, alpha, bg, light_x, strength=1.0):
+    """합성 마무리: 제품과 배경이 같은 빛·같은 사진 안에 있는 것처럼.
+
+    1) 라이트 랩: 배경의 밝은 빛이 제품 가장자리로 살짝 번져 들어오게
+       (오려 붙인 듯한 딱딱한 윤곽 완화)
+    2) 자연광: 빛이 오는 쪽 위(창가)는 밝고 따뜻하게, 반대쪽 아래는 은은하게
+       어둡게 — 제품과 배경에 똑같이 적용
+    3) 같은 그레인(필름 입자)을 화면 전체에
+    """
+    h, w = alpha.shape
+    ys, xs = np.nonzero(alpha > 0.5)
+    r = max(xs.max() - xs.min(), ys.max() - ys.min())
+    a = alpha.astype(np.float32)
+    inner = np.clip(cv2.GaussianBlur(1 - a, (0, 0), r * 0.012) * a * 2.2, 0, 1)
+    bgb = cv2.GaussianBlur(bg, (0, 0), r * 0.02)
+    wrap = (inner * 0.35 * strength)[..., None]
+    out = out * (1 - wrap) + np.maximum(out, bgb) * wrap
+
+    y = np.arange(h, dtype=np.float32)[:, None]
+    x = np.arange(w, dtype=np.float32)[None, :]
+    side = np.sign(light_x) if abs(light_x) > 0.08 else 1.0
+    gx = (x / w - 0.5) * 2 * side                     # 빛 쪽 +1
+    gy = 1 - y / h                                     # 위쪽 +1
+    lightmap = np.clip(0.55 * gx + 0.45 * gy, -1, 1)  # -1 ~ +1
+    # 밝아지는 쪽은 +6%, 어두워지는 쪽은 −3%만 (배경이 칙칙해지지 않게)
+    gain = 1 + strength * np.where(lightmap > 0, 0.06, 0.03) * lightmap
+    warm = np.stack([1 - 0.015 * strength * lightmap,  # B
+                     np.ones_like(lightmap),            # G
+                     1 + 0.02 * strength * lightmap], -1)  # R
+    out = out * gain[..., None] * warm
+    rng = np.random.default_rng(1)
+    out = out + rng.normal(0, 1.6 * strength, (h, w, 1)).astype(np.float32)
+    return out
+
+
+def window_light(bg, alpha, light_x, seam, strength=1.0):
+    """창가 자연광: 빛 쪽 벽에 비스듬한 부드러운 빛 자국 + 제품이 벽에 드리운
+    아주 옅고 넓게 번진 그림자 (제품과 벽 사이 거리감을 만들어 떠 보임을 줄임)."""
+    h, w = alpha.shape
+    ys, xs = np.nonzero(alpha > 0.5)
+    r = max(xs.max() - xs.min(), ys.max() - ys.min())
+    side = np.sign(light_x) if abs(light_x) > 0.08 else 1.0
+    y = np.arange(h, dtype=np.float32)[:, None]
+    x = np.arange(w, dtype=np.float32)[None, :]
+    above = np.clip((seam - y) / (h * 0.02) + 0.5, 0, 1)        # 벽에만
+    # 빛 자국: 빛 쪽에서 들어오는 비스듬한 넓은 띠
+    u = (x / w - 0.5) * side - (y / h - 0.5) * 0.6
+    patch = np.exp(-((u - 0.28) / 0.22) ** 2) * above
+    patch = cv2.GaussianBlur(patch.astype(np.float32), (0, 0), w * 0.03)
+    # 벽 그림자: 실루엣을 빛 반대쪽·살짝 위로 밀고 크게 흐리게
+    sil = (alpha > 0.5).astype(np.float32)
+    M = np.float32([[1, 0, -side * r * 0.18], [0, 1, -r * 0.03]])
+    ws = cv2.GaussianBlur(cv2.warpAffine(sil, M, (w, h)), (0, 0), r * 0.09) * above
+    gain = 1 + 0.06 * strength * patch - 0.10 * strength * ws
+    return bg * gain[..., None]
+
+
 def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, style="auto",
-           cast=1.0, reflect=0.0, wall=0.65):
-    """배경 생성 + 그림자 + 합성. alpha==1 인 제품 픽셀은 원본 그대로.
+           cast=1.0, reflect=0.0, wall=0.65, grade=None):
+    """배경 생성 + 그림자 + 합성.
 
     style: "split"(벽·바닥 경계), "sweep"(경계 없는 스튜디오),
            "flat"(위에서 내려다본 접시 등: 벽 없는 바닥면), "auto"(제품 비율로 선택)
+    grade: None 이면 제품 픽셀은 원본 그대로(1비트도 안 바뀜).
+           dict(sat, wb, contrast, light) 이면 제품 색 보정 + 자연광 통합 마무리.
     """
     h, w = alpha.shape
     _, _, _, _, bot = footprint(alpha)
     if style == "auto":
         style = choose_backdrop(alpha)
+    prod = img_t.astype(np.float32)
+    if grade is not None:
+        prod = grade_product(img_t, alpha, wall_bgr, grade.get("sat", 1.25),
+                             grade.get("wb", 0.6), grade.get("contrast", 1.05))
     if style == "flat":
         bg = backdrop_flat(w, h, wall_bgr, light_x)
         s = shadows_flat(alpha, light_x, shadow_strength)[..., None]
         shade = np.asarray(wall_bgr, np.float32) * 0.42
         bg = bg * (1 - s) + shade * s
-        a = alpha[..., None]
-        out = np.clip(np.rint(img_t.astype(np.float32) * a + bg * (1 - a)), 0, 255).astype(np.uint8)
-        inside = alpha >= 1.0
-        out[inside] = img_t[inside]
-        return out
-    if style == "split":
-        # 참고 사진처럼 테이블은 벽보다 명도 3.5 정도만 낮고 살짝 따뜻하게
-        L, A, B = bgr_to_lab(wall_bgr)[0]
-        floor_bgr = lab_to_bgr(np.array([L - 3.5, A * 1.05, B * 1.05 + 2.5], np.float32))[0]
-        bg = backdrop_split(w, h, wall_bgr, floor_bgr, seam_y(alpha, wall), bot, light_x)
     else:
-        bg = backdrop(w, h, wall_bgr, floor_bgr, bot, light_x)
-    s = shadows(alpha, light_x, shadow_strength, cast)[..., None]
-    # 그림자 색: 바닥색을 어둡고 약간 진하게 (회색이 아닌 같은 톤의 그늘)
-    shade = np.asarray(floor_bgr, np.float32) * 0.42
-    bg = bg * (1 - s) + shade * s
-    if reflect > 0:
-        refl, ra = reflection(img_t, alpha, reflect)
-        bg = bg * (1 - ra[..., None]) + refl * ra[..., None]
+        if style == "split":
+            # 참고 사진처럼 테이블은 벽보다 명도 3.5 정도만 낮고 살짝 따뜻하게
+            L, A, B = bgr_to_lab(wall_bgr)[0]
+            floor_bgr = lab_to_bgr(np.array([L - 3.5, A * 1.05, B * 1.05 + 2.5], np.float32))[0]
+            bg = backdrop_split(w, h, wall_bgr, floor_bgr, seam_y(alpha, wall), bot, light_x)
+        else:
+            bg = backdrop(w, h, wall_bgr, floor_bgr, bot, light_x)
+        s = shadows(alpha, light_x, shadow_strength, cast)[..., None]
+        # 그림자 색: 바닥색을 어둡고 약간 진하게 (회색이 아닌 같은 톤의 그늘)
+        shade = np.asarray(floor_bgr, np.float32) * 0.42
+        bg = bg * (1 - s) + shade * s
+        if grade is not None and style == "split":
+            bg = window_light(bg, alpha, light_x, seam_y(alpha, wall), grade.get("light", 1.0))
+        if reflect > 0:
+            refl, ra = reflection(np.clip(prod, 0, 255).astype(np.uint8), alpha, reflect)
+            bg = bg * (1 - ra[..., None]) + refl * ra[..., None]
     a = alpha[..., None]
-    out = img_t.astype(np.float32) * a + bg * (1 - a)
+    out = prod * a + bg * (1 - a)
+    if grade is not None:
+        out = unify_light(out, alpha, bg, light_x, grade.get("light", 1.0))
+        return np.clip(np.rint(out), 0, 255).astype(np.uint8)
     out = np.clip(np.rint(out), 0, 255).astype(np.uint8)
     inside = alpha >= 1.0
     out[inside] = img_t[inside]  # 제품 픽셀 1비트도 안 바뀌게 보장

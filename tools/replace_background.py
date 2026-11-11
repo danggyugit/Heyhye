@@ -3,7 +3,10 @@
   원본 사진 → rembg 제품 분리 → 바닥 반사 제거 → 배경색 추천
   → 스튜디오 배경 + 빛 방향에 맞춘 그림자 → 합성
 
-제품 픽셀은 일절 수정하지 않는다(마스크 안쪽은 원본 값을 그대로 복사).
+제품은 형태를 바꾸지 않고 색만 가볍게 보정한다: 철판·창가 빛 때문에 낀
+푸른 기를 덜고(--wb), 채도를 올려 선명하게(--sat). 마지막에 창가 자연광·
+벽 그림자·라이트 랩·그레인을 제품과 배경에 함께 입혀 한 장면처럼 보이게 한다.
+--keep-product 를 주면 예전처럼 제품 픽셀을 원본 그대로 유지한다.
 배경색은 기본으로 아이보리(#F2EADE)를 쓴다. 제품 색을 분석한 추천 후보
 (톤온톤·보색·포인트·뉴트럴)도 출력하며 --bg auto 등으로 고를 수 있다.
 
@@ -383,6 +386,14 @@ def main():
                         "제품이 떠 보이면 올리기")
     p.add_argument("--reflect", type=float, default=0.18,
                    help="반광택 테이블에 비친 제품의 세기 (기본 0.18, 0=반사 없음)")
+    p.add_argument("--keep-product", action="store_true",
+                   help="제품 픽셀을 원본 그대로 유지 (색 보정·자연광 마무리 끔)")
+    p.add_argument("--sat", type=float, default=1.25,
+                   help="제품 채도(바이브런스) 배율. 1.0=그대로, 기본 1.25")
+    p.add_argument("--wb", type=float, default=0.6,
+                   help="제품에 낀 푸른 기(철판·창가 빛) 보정 정도 0~1, 기본 0.6")
+    p.add_argument("--light", type=float, default=1.0,
+                   help="자연광 마무리(창가 빛·벽 그림자·라이트 랩·그레인) 세기, 0=끔")
     p.add_argument("--mask-out", help="알파 마스크 저장 경로(선택)")
     p.add_argument("--view", choices=["top", "side"], default="top",
                    help="top: 위에서 내려다본 사진, side: 옆에서 찍은 사진 "
@@ -421,6 +432,7 @@ def main():
         args.reflect = 0.0
     img_t, alpha = place(img, alpha, h, w, canvas=canvas, center=flat)
     light_x = studio.light_direction(img_t, alpha)
+    grade = None if args.keep_product else dict(sat=args.sat, wb=args.wb, light=args.light)
     cands = studio.recommend_backgrounds(img_t, alpha, ref)
 
     print("배경색 추천:")
@@ -446,11 +458,11 @@ def main():
     print(f"사용: {chosen['label_ko']} {studio.hex_of(chosen['wall'])}")
 
     out = studio.render(img_t, alpha, chosen["wall"], chosen["floor"], light_x, args.shadow,
-                        args.backdrop, args.cast, args.reflect, args.wall)
+                        args.backdrop, args.cast, args.reflect, args.wall, grade)
     cv2.imwrite(args.output, out, [cv2.IMWRITE_JPEG_QUALITY, 97])
     if args.palette_sheet:
         renders = [studio.render(img_t, alpha, c["wall"], c["floor"], light_x, args.shadow,
-                                 args.backdrop, args.cast, args.reflect, args.wall)
+                                 args.backdrop, args.cast, args.reflect, args.wall, grade)
                    for c in cands]
         studio.palette_sheet(renders, cands, args.palette_sheet)
     if args.mask_out:
