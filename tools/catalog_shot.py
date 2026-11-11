@@ -190,16 +190,18 @@ def harmonize_product(img_t, alpha, bg, floor_bgr, P):
     H = bot - top
     yy = np.arange(h, dtype=np.float32)[:, None]
 
-    # 1) 색 끼임 제거 (Lab a·b 평균 이동, 무채색 픽셀 기준)
+    # 1) 색 끼임 제거 — 흰색에 가까운 부분(흰 굽·흰 유약)에 낀 푸른/녹색 끼만 덜어낸다.
+    #    제품 고유색(황토·청자 등)은 건드리지 않도록 채도가 낮을수록만 적용
     lab = cv2.cvtColor(np.clip(prod, 0, 255).astype(np.uint8), cv2.COLOR_BGR2Lab).astype(np.float32)
     C = np.hypot(lab[..., 1] - 128, lab[..., 2] - 128)
-    neutral = m & (C < 14) & (lab[..., 0] > 120)
-    if neutral.sum() > 500 and P.neutralize > 0:
+    neutral = m & (C < 10) & (lab[..., 0] > 170)
+    if neutral.sum() > 300 and P.neutralize > 0:
         tgt = cv2.cvtColor(np.uint8([[floor_bgr]]), cv2.COLOR_BGR2Lab)[0, 0].astype(np.float32)
-        shift = (np.array([128 + (tgt[1] - 128) * 0.5, 128 + (tgt[2] - 128) * 0.5])
-                 - np.array([np.median(lab[..., 1][neutral]), np.median(lab[..., 2][neutral])]))
-        lab[..., 1] += shift[0] * P.neutralize
-        lab[..., 2] += shift[1] * P.neutralize
+        cast = np.array([np.median(lab[..., 1][neutral]), np.median(lab[..., 2][neutral])])
+        shift = np.array([128 + (tgt[1] - 128) * 0.5, 128 + (tgt[2] - 128) * 0.5]) - cast
+        wgt = (np.clip(1 - C / 18, 0, 1) * np.clip((lab[..., 0] - 120) / 60, 0, 1)) * P.neutralize
+        lab[..., 1] += shift[0] * wgt
+        lab[..., 2] += shift[1] * wgt
         prod = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_Lab2BGR).astype(np.float32)
 
     # 2) 제품 하단 AO + 3) 바닥 반사광 (아래 가장자리에서의 거리 기준)
