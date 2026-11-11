@@ -379,9 +379,10 @@ def remove_crease_reflection(img_bgr, alpha, zone=0.12):
 # 기본 배경: 따뜻한 아이보리. 제품과 비슷한 색 배경은 제품이 묻혀 보여서
 # 모든 제품에 같은 중립 밝은 색을 쓴다.
 IVORY = "#F2EADE"
+STUDIO = "#E0D7D0"  # 스튜디오 배경 기본색(참고 사진의 웜그레이)
 
 
-def place(img, alpha, h, w, max_w=0.76, max_h=0.74, canvas=None, center=False):
+def place(img, alpha, h, w, max_w=0.76, max_h=0.74, canvas=None, center=False, bottom=0.80):
     """제품을 평행이동만 해서(크기·회전 변경 없음 → 픽셀 재샘플링 없음) 배치.
 
     가로 중앙, 바닥 닿는 선을 캔버스 80% 높이에. 제품이 커서 여백이 부족하면
@@ -395,7 +396,7 @@ def place(img, alpha, h, w, max_w=0.76, max_h=0.74, canvas=None, center=False):
     if canvas:  # 세트 사진 크기 통일용 고정 캔버스 (필요하면 그보다 크게)
         W, H = max(W, canvas[0]), max(H, canvas[1])
     dx = int(round(W / 2 - (xs.min() + xs.max()) / 2))
-    dy = int(round(H * 0.80 - ys.max()))
+    dy = int(round(H * bottom - ys.max()))
     if center:  # 위에서 본 사진: 세로도 가운데
         dy = int(round(H / 2 - (ys.min() + ys.max()) / 2))
     elif ys.min() + dy < H * 0.06:
@@ -410,15 +411,18 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("product")
     p.add_argument("output")
-    p.add_argument("--bg", default="ivory",
-                   help="배경색. ivory(기본, #F2EADE) | auto(제품 색 기반 추천 1순위) | tonal | "
+    p.add_argument("--bg", default="default",
+                   help="배경색. default(스튜디오는 웜그레이 #E0D7D0, 그 외 아이보리) | "
+                        "studio(#E0D7D0) | ivory(#F2EADE) | auto(제품 색 기반 추천 1순위) | tonal | "
                         "complement | accent | neutral | reference(--bg-ref 이미지 색) | "
                         "1,2,3..(추천 순위) | #RRGGBB")
     p.add_argument("--bg-ref", help="배경 색감 참고 이미지(선택). 주면 후보에 '참고 배경'이 추가됨")
     p.add_argument("--palette-sheet", help="배경색 후보별 결과를 나란히 놓은 비교 이미지 저장 경로")
     p.add_argument("--canvas", help="출력 크기 고정 WxH (예: 1628x2171). 세트 사진 크기 통일용")
-    p.add_argument("--backdrop", choices=["auto", "split", "sweep", "flat"], default="auto",
-                   help="배경 형태. split: 벽과 바닥(테이블)이 경계선으로 나뉨(높이가 있는 제품), "
+    p.add_argument("--backdrop", choices=["auto", "studio", "split", "sweep", "flat"], default="auto",
+                   help="배경 형태. studio: 제품 촬영 스튜디오(가운데 조명, 부드러운 벽·바닥, "
+                        "길고 흐릿한 그림자, 넉넉한 여백) — 높이 있는 제품의 기본. "
+                        "split: 벽과 바닥(테이블)이 경계선으로 나뉨, "
                         "sweep: 경계 없는 스튜디오(접시 등 납작한 제품). "
                         "flat: 바로 위에서 내려다본 사진(접시 앞·뒷면) — 벽 없는 바닥면, 가운데 배치. "
                         "auto: 제품 비율로 자동")
@@ -474,7 +478,13 @@ def main():
     flat = args.backdrop == "flat"
     if flat:
         args.reflect = 0.0
-    img_t, alpha = place(img, alpha, h, w, canvas=canvas, center=flat)
+    # 스튜디오(기본): 참고 사진처럼 여백을 넉넉히, 바닥선을 화면 89% 높이에
+    studio_look = args.backdrop in ("auto", "studio") and studio.choose_backdrop(alpha) == "studio" \
+        if args.backdrop == "auto" else args.backdrop == "studio"
+    if studio_look:
+        img_t, alpha = place(img, alpha, h, w, max_w=0.5, max_h=0.55, canvas=canvas, bottom=0.89)
+    else:
+        img_t, alpha = place(img, alpha, h, w, canvas=canvas, center=flat)
     light_x = studio.light_direction(img_t, alpha)
     grade = None if args.keep_product else dict(sat=args.sat, wb=args.wb, light=args.light,
                                                   contrast=1.08)
@@ -484,13 +494,16 @@ def main():
     for i, c in enumerate(cands):
         print(f"  {i + 1}. {c['label_ko']:6s} {studio.hex_of(c['wall'])}  --bg {c['name']:10s} {c['note']}")
 
-    bg = IVORY if args.bg == "ivory" else args.bg
+    named = {"ivory": IVORY, "studio": STUDIO,
+             "default": STUDIO if studio_look else IVORY}
+    bg = named.get(args.bg, args.bg)
     if bg.startswith("#"):
         wall = studio.parse_hex(bg)
         lab = studio.bgr_to_lab(wall)[0]
         # 추천 후보와 같은 규칙: 바닥은 명도 −6, 채도 ×1.25
         floor = studio.lab_to_bgr(np.array([lab[0] - 6, lab[1] * 1.25, lab[2] * 1.25], np.float32))[0]
-        chosen = dict(label_ko="아이보리" if args.bg == "ivory" else "직접 지정", wall=wall, floor=floor)
+        names = {IVORY: "아이보리", STUDIO: "스튜디오 웜그레이"}
+        chosen = dict(label_ko=names.get(bg, "직접 지정"), wall=wall, floor=floor)
     elif bg == "auto":
         chosen = cands[0]
     elif bg.isdigit():

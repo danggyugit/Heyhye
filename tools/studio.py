@@ -240,11 +240,79 @@ def backdrop_split(w, h, wall_bgr, floor_bgr, seam, floor_y, light_x):
     return bg
 
 
+# 참고 스튜디오 사진에서 잰 값: 벽 가운데 #E0D7D0 (Lab L≈87), 바닥은 벽보다 밝다
+STUDIO_WALL = "#E0D7D0"
+
+
+def backdrop_studio(w, h, wall_bgr, seam, floor_y, light_x):
+    """제품 촬영 스튜디오 배경 (참고 사진 재현).
+
+    - 벽: 가운데가 가장 밝고 좌우 가장자리·위쪽으로 갈수록 은은하게 어두워짐
+      (가운데를 비추는 조명), 바닥과 만나는 곳 근처가 가장 차분
+    - 벽→바닥: 화면 높이 약 4% 폭으로 아주 부드럽게 이어짐 (선이 거의 안 보임)
+    - 바닥: 벽보다 밝고 카메라 쪽으로 갈수록 더 밝아짐
+    """
+    lab0 = bgr_to_lab(wall_bgr)[0]
+    y = np.arange(h, dtype=np.float32)[:, None]
+    x = np.arange(w, dtype=np.float32)[None, :]
+    cxn = (x - (w / 2 + light_x * w * 0.08)) / (w / 2)       # 조명 중심을 빛 쪽으로 살짝
+    # 벽 명도: 가운데 기준 − 좌우 낙차 − 위쪽 낙차 − 경계 근처 살짝
+    top = np.clip(1 - y / max(seam, 1), 0, 1)
+    wall_L = lab0[0] - 11 * cxn ** 2 - 9 * top ** 1.6 - 3 * np.exp(-((y - seam) / (h * 0.08)) ** 2)
+    # 바닥 명도: 경계에서 벽보다 약간 밝게 시작해 앞쪽으로 갈수록 밝게, 좌우 낙차는 약하게
+    depth = np.clip((y - seam) / max(h - seam, 1), 0, 1)
+    floor_L = lab0[0] + 1.5 + 4.5 * depth ** 0.8 - 4 * cxn ** 2
+    t = np.clip((y - seam) / (h * 0.04) + 0.5, 0, 1)
+    t = t * t * (3 - 2 * t)
+    L = wall_L * (1 - t) + floor_L * t
+    A = np.full_like(L, lab0[1])
+    B = np.full_like(L, lab0[2]) - 0.8 * t                    # 바닥은 아주 조금 덜 노랗게
+    lab = np.dstack([np.clip(L, 0, 100), A, B]).astype(np.float32)
+    bg = cv2.cvtColor(lab, cv2.COLOR_Lab2BGR) * 255
+    rng = np.random.default_rng(0)
+    bg += rng.normal(0, 1.0, (h, w, 1)).astype(np.float32)
+    return bg
+
+
+def shadows_studio(alpha, light_x, strength=1.0):
+    """스튜디오 그림자: 굽 아래 짧고 부드러운 접촉 그늘 + 빛 반대쪽 바닥으로
+    길게 눕는, 멀어질수록 크게 번지고 옅어지는 그림자 (참고 사진처럼)."""
+    h, w = alpha.shape
+    cx, cy, a, b, bot = footprint(alpha)
+    sil = (alpha > 0.5).astype(np.float32)
+    ys, xs = np.nonzero(sil)
+    H = bot - ys.min()
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    floor_w = np.clip((yy - (bot - 2.2 * b - a * 0.04)) / (a * 0.05 + 1), 0, 1)
+
+    def under(px, sigma):
+        M = np.float32([[1, 0, 0], [0, 1, px]])
+        sh = cv2.warpAffine(sil, M, (w, h), flags=cv2.INTER_LINEAR) * floor_w
+        return cv2.GaussianBlur(sh, (0, 0), max(sigma, 0.5))
+
+    contact = under(a * 0.004, a * 0.02)
+    near = under(a * 0.015, a * 0.07)
+    # 바닥에 눕힌 그림자: 높이 hgt 인 점을 옆으로 shear*hgt, 뒤로 sy*hgt
+    dirx = -np.sign(light_x) if abs(light_x) > 0.08 else -1.0
+    shear, sy = 1.15 * dirx, 0.10
+    M = np.float32([[1, -shear, shear * bot], [0, sy, (1 - sy) * bot]])
+    proj = cv2.warpAffine(sil, M, (w, h), flags=cv2.INTER_LINEAR)
+    # 굽에서의 거리(옆 방향)에 따라 점점 크게 흐리고 옅게
+    xx = np.arange(w, dtype=np.float32)[None, :]
+    dist = np.clip(np.abs(xx - cx) / (abs(shear) * H + 1), 0, 1)
+    blurs = [cv2.GaussianBlur(proj, (0, 0), s) for s in (a * 0.035, a * 0.1, a * 0.22)]
+    k = dist * 2
+    cast = np.where(k < 1, blurs[0] * (1 - k) + blurs[1] * k,
+                    blurs[1] * (2 - k) + blurs[2] * (k - 1)) * (1 - dist) ** 0.8
+    s = contact * 0.45 + near * 0.28 + cast * 0.55
+    return np.clip(s * strength, 0, 0.7)
+
+
 def choose_backdrop(alpha):
-    """높이가 있는 제품(높이/폭 ≥ 0.45) → split, 접시처럼 납작하면 → sweep."""
+    """높이가 있는 제품(높이/폭 ≥ 0.45) → studio, 접시처럼 납작하면 → sweep."""
     ys, xs = np.nonzero(alpha > 0.5)
     ratio = (ys.max() - ys.min()) / max(xs.max() - xs.min(), 1)
-    return "split" if ratio >= 0.45 else "sweep"
+    return "studio" if ratio >= 0.45 else "sweep"
 
 
 def shadows(alpha, light_x, strength=1.0, cast=1.0):
@@ -487,7 +555,16 @@ def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, styl
     if grade is not None:
         prod = grade_product(img_t, alpha, wall_bgr, grade.get("sat", 1.35),
                              grade.get("wb", 0.6), grade.get("contrast", 1.08))
-    if style == "flat":
+    if style == "studio":
+        # 참고 사진: 경계선은 바닥 닿는 선보다 화면 높이의 약 10% 위 (제품 뒤)
+        _, _, _, _, b0 = footprint(alpha)
+        H0 = b0 - body_top(alpha)
+        sm = float(np.clip(b0 - 0.10 * h, h * 0.3, b0 - 0.15 * H0))
+        bg = backdrop_studio(w, h, wall_bgr, sm, bot, light_x)
+        s = shadows_studio(alpha, light_x, shadow_strength)[..., None]
+        shade = np.asarray(wall_bgr, np.float32) * np.array([0.46, 0.52, 0.58], np.float32)
+        bg = bg * (1 - s) + shade * s
+    elif style == "flat":
         bg = backdrop_flat(w, h, wall_bgr, light_x)
         s = shadows_flat(alpha, light_x, shadow_strength)[..., None]
         shade = np.asarray(wall_bgr, np.float32) * np.array([0.46, 0.52, 0.58], np.float32)
@@ -512,7 +589,8 @@ def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, styl
     a = alpha[..., None]
     out = prod * a + bg * (1 - a)
     if grade is not None:
-        out = unify_light(out, alpha, bg, light_x, grade.get("light", 1.0))
+        lt = grade.get("light", 1.0) * (0.5 if style == "studio" else 1.0)
+        out = unify_light(out, alpha, bg, light_x, lt)
         return np.clip(np.rint(out), 0, 255).astype(np.uint8)
     out = np.clip(np.rint(out), 0, 255).astype(np.uint8)
     inside = alpha >= 1.0
