@@ -22,6 +22,9 @@
     # 배경 형태: 높이가 있는 제품은 자동으로 벽·테이블(split), 접시 등 납작하면 경계 없는 배경(sweep)
     python tools/replace_background.py product.jpg out.jpg --backdrop sweep
 
+    # 벽·바닥 비율: 벽이 화면 높이의 몇 %를 차지할지 (기본 0.65)
+    python tools/replace_background.py product.jpg out.jpg --wall 0.7
+
     # 떠 보임 조절: 그림자·몸통 그늘 크기(--cast), 테이블 반사(--reflect, 0이면 끔)
     python tools/replace_background.py product.jpg out.jpg --cast 2.6 --reflect 0
 
@@ -350,6 +353,8 @@ def main():
     p.add_argument("--backdrop", choices=["auto", "split", "sweep"], default="auto",
                    help="배경 형태. split: 벽과 바닥(테이블)이 경계선으로 나뉨(높이가 있는 제품), "
                         "sweep: 경계 없는 스튜디오(접시 등 납작한 제품). auto: 제품 비율로 자동")
+    p.add_argument("--wall", type=float, default=0.65,
+                   help="벽·바닥 배경에서 벽이 차지하는 화면 높이 비율 (기본 0.65)")
     p.add_argument("--shadow", type=float, default=1.0, help="그림자 전체 진하기 배율 (기본 1.0)")
     p.add_argument("--cast", type=float, default=2.2,
                    help="몸통 그늘·드리운 그림자의 크기/진하기 (기본 2.2, 1.0=약하게). "
@@ -416,11 +421,11 @@ def main():
     print(f"사용: {chosen['label_ko']} {studio.hex_of(chosen['wall'])}")
 
     out = studio.render(img_t, alpha, chosen["wall"], chosen["floor"], light_x, args.shadow,
-                        args.backdrop, args.cast, args.reflect)
+                        args.backdrop, args.cast, args.reflect, args.wall)
     cv2.imwrite(args.output, out, [cv2.IMWRITE_JPEG_QUALITY, 97])
     if args.palette_sheet:
         renders = [studio.render(img_t, alpha, c["wall"], c["floor"], light_x, args.shadow,
-                                 args.backdrop, args.cast, args.reflect)
+                                 args.backdrop, args.cast, args.reflect, args.wall)
                    for c in cands]
         studio.palette_sheet(renders, cands, args.palette_sheet)
     if args.mask_out:

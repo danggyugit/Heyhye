@@ -191,11 +191,12 @@ def body_top(alpha, frac=0.45):
     return int(rows[np.argmax(widths >= frac * widths.max())])
 
 
-def seam_y(alpha, k=0.58):
+def seam_y(alpha, wall=0.65):
     """벽-바닥 경계선 높이.
 
-    참고 사진(머그 정면)처럼 바닥에서 몸통 높이의 약 58% 위에 둔다.
-    식물·손잡이처럼 얇게 솟은 부분은 높이 계산에서 뺀다.
+    벽이 화면 높이의 wall 비율(기본 65%)을 차지하도록 경계선을 둔다
+    (바닥보다 벽이 넓어 보이게). 단 경계선은 제품 뒤에 있어야 하므로
+    바닥 닿는 선에서 몸통 높이의 15% 이상 위로 유지한다.
     굽 타원이 아주 둥글면(위에서 크게 내려다본 사진) 경계선을 제품 위쪽 뒤로 올린다.
     """
     h = alpha.shape[0]
@@ -203,8 +204,8 @@ def seam_y(alpha, k=0.58):
     top = body_top(alpha)
     H = bot - top
     if b / max(a, 1) > 0.45:
-        k = 1.05
-    return float(np.clip(bot - k * H, h * 0.10, bot - 0.25 * H))
+        return float(np.clip(bot - 1.05 * H, h * 0.10, bot - 0.25 * H))
+    return float(np.clip(min(wall * h, bot - 0.15 * H), h * 0.10, bot - 0.15 * H))
 
 
 def backdrop_split(w, h, wall_bgr, floor_bgr, seam, floor_y, light_x):
@@ -340,7 +341,7 @@ def reflection(img_t, alpha, strength=0.12, length=0.28):
 
 
 def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, style="auto",
-           cast=1.0, reflect=0.0):
+           cast=1.0, reflect=0.0, wall=0.65):
     """배경 생성 + 그림자 + 합성. alpha==1 인 제품 픽셀은 원본 그대로.
 
     style: "split"(벽·바닥 경계), "sweep"(경계 없는 스튜디오), "auto"(제품 비율로 선택)
@@ -353,7 +354,7 @@ def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, styl
         # 참고 사진처럼 테이블은 벽보다 명도 3.5 정도만 낮고 살짝 따뜻하게
         L, A, B = bgr_to_lab(wall_bgr)[0]
         floor_bgr = lab_to_bgr(np.array([L - 3.5, A * 1.05, B * 1.05 + 2.5], np.float32))[0]
-        bg = backdrop_split(w, h, wall_bgr, floor_bgr, seam_y(alpha), bot, light_x)
+        bg = backdrop_split(w, h, wall_bgr, floor_bgr, seam_y(alpha, wall), bot, light_x)
     else:
         bg = backdrop(w, h, wall_bgr, floor_bgr, bot, light_x)
     s = shadows(alpha, light_x, shadow_strength, cast)[..., None]
