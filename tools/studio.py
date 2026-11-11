@@ -306,6 +306,43 @@ def shadows(alpha, light_x, strength=1.0, cast=1.0):
     return np.clip(s * strength, 0, 0.8)
 
 
+def backdrop_flat(w, h, color_bgr, light_x):
+    """위에서 내려다본 사진(접시 등)용: 벽 없이 평평한 바닥면.
+
+    빛 쪽이 아주 살짝 밝고, 가장자리로 갈수록 은은하게 어두워진다.
+    """
+    y = np.arange(h, dtype=np.float32)[:, None, None]
+    x = np.arange(w, dtype=np.float32)[None, :, None]
+    bg = np.asarray(color_bgr, np.float32) * np.ones((h, w, 1), np.float32)
+    bg *= 1 + 0.035 * light_x * ((x / w) * 2 - 1) + 0.02 * (1 - y / h)
+    d = np.sqrt(((x - w / 2) / (0.7 * w)) ** 2 + ((y - h / 2) / (0.7 * h)) ** 2)
+    bg *= 1 - 0.07 * np.clip(d - 0.6, 0, 1)
+    rng = np.random.default_rng(0)
+    bg += rng.normal(0, 1.0, (h, w, 1)).astype(np.float32)
+    return bg
+
+
+def shadows_flat(alpha, light_x, strength=1.0):
+    """위에서 본 제품의 그림자: 테두리를 감싸는 짙은 접촉 그늘 +
+    빛 반대쪽(아래·옆)으로 살짝 밀린 넓고 부드러운 그림자."""
+    h, w = alpha.shape
+    sil = (alpha > 0.5).astype(np.float32)
+    ys, xs = np.nonzero(sil)
+    r = max(xs.max() - xs.min(), ys.max() - ys.min()) / 2
+    dx = -np.sign(light_x) * r * 0.035 if abs(light_x) > 0.08 else 0.0
+    dy = r * 0.045
+
+    def shifted(ox, oy, sigma):
+        M = np.float32([[1, 0, ox], [0, 1, oy]])
+        return cv2.GaussianBlur(cv2.warpAffine(sil, M, (w, h)), (0, 0), sigma)
+
+    contact = shifted(dx * 0.2, dy * 0.2, r * 0.012)
+    soft = shifted(dx, dy, r * 0.07)
+    wide = shifted(dx * 1.5, dy * 1.5, r * 0.16)
+    s = contact * 0.45 + soft * 0.34 + wide * 0.16
+    return np.clip(s * strength, 0, 0.7)
+
+
 def reflection(img_t, alpha, strength=0.12, length=0.28):
     """반광택 테이블에 비친 제품 (배경에만 그림).
 
@@ -344,12 +381,23 @@ def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, styl
            cast=1.0, reflect=0.0, wall=0.65):
     """배경 생성 + 그림자 + 합성. alpha==1 인 제품 픽셀은 원본 그대로.
 
-    style: "split"(벽·바닥 경계), "sweep"(경계 없는 스튜디오), "auto"(제품 비율로 선택)
+    style: "split"(벽·바닥 경계), "sweep"(경계 없는 스튜디오),
+           "flat"(위에서 내려다본 접시 등: 벽 없는 바닥면), "auto"(제품 비율로 선택)
     """
     h, w = alpha.shape
     _, _, _, _, bot = footprint(alpha)
     if style == "auto":
         style = choose_backdrop(alpha)
+    if style == "flat":
+        bg = backdrop_flat(w, h, wall_bgr, light_x)
+        s = shadows_flat(alpha, light_x, shadow_strength)[..., None]
+        shade = np.asarray(wall_bgr, np.float32) * 0.42
+        bg = bg * (1 - s) + shade * s
+        a = alpha[..., None]
+        out = np.clip(np.rint(img_t.astype(np.float32) * a + bg * (1 - a)), 0, 255).astype(np.uint8)
+        inside = alpha >= 1.0
+        out[inside] = img_t[inside]
+        return out
     if style == "split":
         # 참고 사진처럼 테이블은 벽보다 명도 3.5 정도만 낮고 살짝 따뜻하게
         L, A, B = bgr_to_lab(wall_bgr)[0]

@@ -22,6 +22,9 @@
     # 배경 형태: 높이가 있는 제품은 자동으로 벽·테이블(split), 접시 등 납작하면 경계 없는 배경(sweep)
     python tools/replace_background.py product.jpg out.jpg --backdrop sweep
 
+    # 바로 위에서 찍은 접시: 벽 없는 바닥면, 둘레 그림자
+    python tools/replace_background.py plate.jpg out.jpg --model birefnet-general --reflection none --backdrop flat
+
     # 벽·바닥 비율: 벽이 화면 높이의 몇 %를 차지할지 (기본 0.65)
     python tools/replace_background.py product.jpg out.jpg --wall 0.7
 
@@ -273,12 +276,17 @@ def remove_crease_reflection(img_bgr, alpha, zone=0.12):
         col = np.nonzero(solid[:, x])[0]
         if not len(col) or col.max() < lim:
             continue
+        # 후보 중 '밝은 선 → 어두운 접지선' 대비가 가장 큰 곳을 고른다
+        # (반사 띠 안의 약한 명암 변화를 접지선으로 오인하지 않게)
+        best, by = 0.0, None
         for y in range(col.max(), max(lim, col.min() + 10), -1):
             above = g[y - 9:y - 1, x]
-            if above.max() > 170 and above.max() - g[y, x] > 45 and g[y, x] <= g[y - 1:y + 2, x].min():
-                X.append(x)
-                T.append(y - 1)
-                break
+            drop = above.max() - g[y, x]
+            if above.max() > 170 and drop > 45 and g[y, x] <= g[y - 1:y + 2, x].min() and drop > best:
+                best, by = drop, y
+        if by is not None:
+            X.append(x)
+            T.append(by - 1)
     if len(X) < 20:
         return alpha
     X, T = np.array(X, float), np.array(T, float)
@@ -293,6 +301,16 @@ def remove_crease_reflection(img_bgr, alpha, zone=0.12):
     pts = np.stack([X[keep], T[keep]], 1).astype(np.float32)
     (ecx, ecy), (d1, d2), ang = cv2.fitEllipse(pts)
     ea, eb = max(d1, d2) / 2, min(d1, d2) / 2
+    # 흰 굽 선이 가운데서만 보여 타원이 몸통보다 좁게 맞춰졌으면(원통형 컵 등),
+    # 타원 폭을 굽 바로 위 몸통 폭에 고정하고 높이만 다시 맞춘다
+    r0 = int(T[keep].min()) - 12
+    bc = np.nonzero(alpha[r0] > 0.5)[0]
+    if len(bc) and 2 * ea < 0.9 * (bc.max() - bc.min()):
+        ecx, ea = (bc.max() + bc.min()) / 2, (bc.max() - bc.min()) / 2
+        sq = np.sqrt(np.clip(1 - ((X[keep] - ecx) / ea) ** 2, 0, 1))
+        A = np.stack([np.ones_like(sq), sq], 1)
+        (ecy, eb), *_ = np.linalg.lstsq(A, T[keep], rcond=None)
+        ang = 90.0
     if abs(((ang + 90) % 180) - 90) < 15 or abs(((ang) % 180) - 90) < 15:
         # 축이 거의 수평/수직인 타원만 사용: 아래 호 y = cy + b·sqrt(1-((x-cx)/a)^2)
         t = np.clip((xx - ecx) / ea, -1, 1)
@@ -316,7 +334,7 @@ def remove_crease_reflection(img_bgr, alpha, zone=0.12):
 IVORY = "#F2EADE"
 
 
-def place(img, alpha, h, w, max_w=0.76, max_h=0.74, canvas=None):
+def place(img, alpha, h, w, max_w=0.76, max_h=0.74, canvas=None, center=False):
     """제품을 평행이동만 해서(크기·회전 변경 없음 → 픽셀 재샘플링 없음) 배치.
 
     가로 중앙, 바닥 닿는 선을 캔버스 80% 높이에. 제품이 커서 여백이 부족하면
@@ -331,7 +349,9 @@ def place(img, alpha, h, w, max_w=0.76, max_h=0.74, canvas=None):
         W, H = max(W, canvas[0]), max(H, canvas[1])
     dx = int(round(W / 2 - (xs.min() + xs.max()) / 2))
     dy = int(round(H * 0.80 - ys.max()))
-    if ys.min() + dy < H * 0.06:
+    if center:  # 위에서 본 사진: 세로도 가운데
+        dy = int(round(H / 2 - (ys.min() + ys.max()) / 2))
+    elif ys.min() + dy < H * 0.06:
         dy = int(round(H * 0.06 - ys.min()))
     M = np.float32([[1, 0, dx], [0, 1, dy]])
     return (cv2.warpAffine(img, M, (W, H), flags=cv2.INTER_NEAREST),
@@ -350,9 +370,11 @@ def main():
     p.add_argument("--bg-ref", help="배경 색감 참고 이미지(선택). 주면 후보에 '참고 배경'이 추가됨")
     p.add_argument("--palette-sheet", help="배경색 후보별 결과를 나란히 놓은 비교 이미지 저장 경로")
     p.add_argument("--canvas", help="출력 크기 고정 WxH (예: 1628x2171). 세트 사진 크기 통일용")
-    p.add_argument("--backdrop", choices=["auto", "split", "sweep"], default="auto",
+    p.add_argument("--backdrop", choices=["auto", "split", "sweep", "flat"], default="auto",
                    help="배경 형태. split: 벽과 바닥(테이블)이 경계선으로 나뉨(높이가 있는 제품), "
-                        "sweep: 경계 없는 스튜디오(접시 등 납작한 제품). auto: 제품 비율로 자동")
+                        "sweep: 경계 없는 스튜디오(접시 등 납작한 제품). "
+                        "flat: 바로 위에서 내려다본 사진(접시 앞·뒷면) — 벽 없는 바닥면, 가운데 배치. "
+                        "auto: 제품 비율로 자동")
     p.add_argument("--wall", type=float, default=0.65,
                    help="벽·바닥 배경에서 벽이 차지하는 화면 높이 비율 (기본 0.65)")
     p.add_argument("--shadow", type=float, default=1.0, help="그림자 전체 진하기 배율 (기본 1.0)")
@@ -394,7 +416,10 @@ def main():
         alpha = remove_crease_reflection(img, alpha)
 
     canvas = tuple(int(v) for v in args.canvas.lower().split("x")) if args.canvas else None
-    img_t, alpha = place(img, alpha, h, w, canvas=canvas)
+    flat = args.backdrop == "flat"
+    if flat:
+        args.reflect = 0.0
+    img_t, alpha = place(img, alpha, h, w, canvas=canvas, center=flat)
     light_x = studio.light_direction(img_t, alpha)
     cands = studio.recommend_backgrounds(img_t, alpha, ref)
 
