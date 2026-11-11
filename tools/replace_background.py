@@ -19,6 +19,9 @@
     # 옆모습: 얇은 흰 굽 선 바로 아래 어두운 접지선 + 반사
     python tools/replace_background.py product.jpg out.jpg --model birefnet-general --reflection crease
 
+    # 배경 형태: 높이가 있는 제품은 자동으로 벽·테이블(split), 접시 등 납작하면 경계 없는 배경(sweep)
+    python tools/replace_background.py product.jpg out.jpg --backdrop sweep
+
     # 한 제품의 여러 각도 사진을 세트로: 배경색·캔버스 크기 통일
     python tools/replace_background.py a.jpg a_out.jpg --bg "#EDE0D2" --canvas 1628x2171
 
@@ -335,6 +338,9 @@ def main():
     p.add_argument("--bg-ref", help="배경 색감 참고 이미지(선택). 주면 후보에 '참고 배경'이 추가됨")
     p.add_argument("--palette-sheet", help="배경색 후보별 결과를 나란히 놓은 비교 이미지 저장 경로")
     p.add_argument("--canvas", help="출력 크기 고정 WxH (예: 1628x2171). 세트 사진 크기 통일용")
+    p.add_argument("--backdrop", choices=["auto", "split", "sweep"], default="auto",
+                   help="배경 형태. split: 벽과 바닥(테이블)이 경계선으로 나뉨(높이가 있는 제품), "
+                        "sweep: 경계 없는 스튜디오(접시 등 납작한 제품). auto: 제품 비율로 자동")
     p.add_argument("--shadow", type=float, default=1.0, help="그림자 진하기 배율 (기본 1.0)")
     p.add_argument("--mask-out", help="알파 마스크 저장 경로(선택)")
     p.add_argument("--view", choices=["top", "side"], default="top",
@@ -394,10 +400,12 @@ def main():
         chosen = match[0]
     print(f"사용: {chosen['label_ko']} {studio.hex_of(chosen['wall'])}")
 
-    out = studio.render(img_t, alpha, chosen["wall"], chosen["floor"], light_x, args.shadow)
+    out = studio.render(img_t, alpha, chosen["wall"], chosen["floor"], light_x, args.shadow,
+                        args.backdrop)
     cv2.imwrite(args.output, out, [cv2.IMWRITE_JPEG_QUALITY, 97])
     if args.palette_sheet:
-        renders = [studio.render(img_t, alpha, c["wall"], c["floor"], light_x, args.shadow)
+        renders = [studio.render(img_t, alpha, c["wall"], c["floor"], light_x, args.shadow,
+                                 args.backdrop)
                    for c in cands]
         studio.palette_sheet(renders, cands, args.palette_sheet)
     if args.mask_out:

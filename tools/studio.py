@@ -183,6 +183,64 @@ def backdrop(w, h, wall_bgr, floor_bgr, floor_y, light_x):
     return bg
 
 
+def body_top(alpha, frac=0.45):
+    """몸통 윗선: 폭이 최대 폭의 45% 이상인 가장 위 줄 (식물 잎·손잡이 끝 등 제외)."""
+    solid = alpha > 0.5
+    rows = np.nonzero(solid.any(1))[0]
+    widths = np.array([np.ptp(np.nonzero(solid[r])[0]) for r in rows])
+    return int(rows[np.argmax(widths >= frac * widths.max())])
+
+
+def seam_y(alpha, k=0.58):
+    """벽-바닥 경계선 높이.
+
+    참고 사진(머그 정면)처럼 바닥에서 몸통 높이의 약 58% 위에 둔다.
+    식물·손잡이처럼 얇게 솟은 부분은 높이 계산에서 뺀다.
+    굽 타원이 아주 둥글면(위에서 크게 내려다본 사진) 경계선을 제품 위쪽 뒤로 올린다.
+    """
+    h = alpha.shape[0]
+    _, _, a, b, bot = footprint(alpha)
+    top = body_top(alpha)
+    H = bot - top
+    if b / max(a, 1) > 0.45:
+        k = 1.05
+    return float(np.clip(bot - k * H, h * 0.10, bot - 0.25 * H))
+
+
+def backdrop_split(w, h, wall_bgr, floor_bgr, seam, floor_y, light_x):
+    """벽과 테이블(바닥)이 경계선으로 나뉘는 배경 (높이가 있는 제품용).
+
+    - 경계선은 부드럽지만 또렷하게(높이의 약 1%)
+    - 경계선 바로 아래 바닥은 조금 어둡고 카메라 쪽으로 갈수록 밝게 → 깊이감
+    - 벽은 위로 갈수록 아주 살짝 밝게, 빛 반대쪽은 좀 더 어둡게
+    """
+    y = np.arange(h, dtype=np.float32)[:, None, None]
+    x = np.arange(w, dtype=np.float32)[None, :, None]
+    wall = np.asarray(wall_bgr, np.float32)
+    floor = np.asarray(floor_bgr, np.float32)
+    bw = max(h * 0.006, 2.0)
+    t = np.clip((y - seam) / (2 * bw) + 0.5, 0, 1)
+    t = t * t * (3 - 2 * t)
+    depth = np.clip((y - seam) / max(h - seam, 1), 0, 1)       # 0: 경계선 → 1: 맨 앞
+    floor_col = floor * (0.97 + 0.05 * depth ** 0.7)
+    wall_col = wall * (1 + 0.02 * np.clip((seam - y) / max(seam, 1), 0, 1))
+    bg = (wall_col * (1 - t) + floor_col * t) * np.ones((1, w, 1), np.float32)
+    bg *= 1 + 0.05 * light_x * ((x / w) * 2 - 1)
+    cx = w / 2 + light_x * w * 0.15
+    d = np.sqrt(((x - cx) / (0.8 * w)) ** 2 + ((y - floor_y) / (0.9 * h)) ** 2)
+    bg *= 1 + 0.03 * np.clip(1 - d, 0, 1) - 0.06 * np.clip(d - 0.75, 0, 1)
+    rng = np.random.default_rng(0)
+    bg += rng.normal(0, 1.0, (h, w, 1)).astype(np.float32)
+    return bg
+
+
+def choose_backdrop(alpha):
+    """높이가 있는 제품(높이/폭 ≥ 0.45) → split, 접시처럼 납작하면 → sweep."""
+    ys, xs = np.nonzero(alpha > 0.5)
+    ratio = (ys.max() - ys.min()) / max(xs.max() - xs.min(), 1)
+    return "split" if ratio >= 0.45 else "sweep"
+
+
 def shadows(alpha, light_x, strength=1.0):
     """그림자 농도 맵(0~1). 세 겹:
 
@@ -234,11 +292,22 @@ def shadows(alpha, light_x, strength=1.0):
     return np.clip(s * strength, 0, 0.8)
 
 
-def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0):
-    """배경 생성 + 그림자 + 합성. alpha==1 인 제품 픽셀은 원본 그대로."""
+def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, style="auto"):
+    """배경 생성 + 그림자 + 합성. alpha==1 인 제품 픽셀은 원본 그대로.
+
+    style: "split"(벽·바닥 경계), "sweep"(경계 없는 스튜디오), "auto"(제품 비율로 선택)
+    """
     h, w = alpha.shape
     _, _, _, _, bot = footprint(alpha)
-    bg = backdrop(w, h, wall_bgr, floor_bgr, bot, light_x)
+    if style == "auto":
+        style = choose_backdrop(alpha)
+    if style == "split":
+        # 참고 사진처럼 테이블은 벽보다 명도 3.5 정도만 낮고 살짝 따뜻하게
+        L, A, B = bgr_to_lab(wall_bgr)[0]
+        floor_bgr = lab_to_bgr(np.array([L - 3.5, A * 1.05, B * 1.05 + 2.5], np.float32))[0]
+        bg = backdrop_split(w, h, wall_bgr, floor_bgr, seam_y(alpha), bot, light_x)
+    else:
+        bg = backdrop(w, h, wall_bgr, floor_bgr, bot, light_x)
     s = shadows(alpha, light_x, shadow_strength)[..., None]
     # 그림자 색: 바닥색을 어둡고 약간 진하게 (회색이 아닌 같은 톤의 그늘)
     shade = np.asarray(floor_bgr, np.float32) * 0.42
