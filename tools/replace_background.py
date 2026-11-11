@@ -304,16 +304,10 @@ def remove_crease_reflection(img_bgr, alpha, zone=0.12):
     pts = np.stack([X[keep], T[keep]], 1).astype(np.float32)
     (ecx, ecy), (d1, d2), ang = cv2.fitEllipse(pts)
     ea, eb = max(d1, d2) / 2, min(d1, d2) / 2
-    # 흰 굽 선이 가운데서만 보여 타원이 몸통보다 좁게 맞춰졌으면(원통형 컵 등),
-    # 타원 폭을 굽 바로 위 몸통 폭에 고정하고 높이만 다시 맞춘다
+    # 굽 타원이 굽 바로 위 몸통보다 훨씬 좁은지(아래 모서리가 둥근 컵 등) 확인
     r0 = int(T[keep].min()) - 12
     bc = np.nonzero(alpha[r0] > 0.5)[0]
-    if len(bc) and 2 * ea < 0.9 * (bc.max() - bc.min()):
-        ecx, ea = (bc.max() + bc.min()) / 2, (bc.max() - bc.min()) / 2
-        sq = np.sqrt(np.clip(1 - ((X[keep] - ecx) / ea) ** 2, 0, 1))
-        A = np.stack([np.ones_like(sq), sq], 1)
-        (ecy, eb), *_ = np.linalg.lstsq(A, T[keep], rcond=None)
-        ang = 90.0
+    narrow = bool(len(bc)) and 2 * ea < 0.9 * (bc.max() - bc.min())
     if abs(((ang + 90) % 180) - 90) < 15 or abs(((ang) % 180) - 90) < 15:
         # 축이 거의 수평/수직인 타원만 사용: 아래 호 y = cy + b·sqrt(1-((x-cx)/a)^2)
         t = np.clip((xx - ecx) / ea, -1, 1)
@@ -321,7 +315,57 @@ def remove_crease_reflection(img_bgr, alpha, zone=0.12):
         # 타원 끝 바로 바깥(18px)은 끝 높이로 잘라 반사 조각을 없애고,
         # 그보다 바깥은 몸통이므로 자르지 않는다
         edge = (np.abs(xx - ecx) > ea) & (np.abs(xx - ecx) <= ea + 18)
+        if narrow:
+            # 굽이 몸통보다 좁으면(둥근 아래 모서리), 굽 바깥 모서리 아래는 반사뿐 →
+            # 굽 타원 끝 높이에서 몸통 폭 끝까지 모두 자른다
+            edge = np.abs(xx - ecx) > ea
         cut = np.where(inside, ecy + eb * np.sqrt(1 - t * t), np.where(edge, ecy, 1e9))
+        if narrow:
+            # 굽 바깥 열: 몸통 색보다 반사 띠 색(굽 아래에서 잰 색)에 가까워지는 지점부터
+            # 자른 뒤, 굽 타원 컷과 이어지게 전체를 매끈하게 다듬는다
+            lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2Lab).astype(np.float32)
+            ytop = int(T[keep].min())
+            ref = np.median(lab[ytop - 40:ytop - 15, int(ecx - ea * 0.6):int(ecx + ea * 0.6)]
+                            .reshape(-1, 3), 0)
+            ybot = int(ecy + eb)
+            band = np.median(lab[ybot + 10:ybot + 35, int(ecx - ea * 0.5):int(ecx + ea * 0.5)]
+                             .reshape(-1, 3), 0)
+            outs = np.nonzero((np.abs(xx - ecx) > ea) & (alpha > 0.5).any(0))[0]
+            for x in outs:
+                col = np.nonzero(alpha[:, x] > 0.5)[0]
+                y0 = max(ytop - 60, col.min())
+                if col.max() - y0 < 6:
+                    continue
+                px = lab[y0:col.max() + 1, x]
+                # 몸통 색보다 반사 띠 색에 더 가까운 픽셀이 4px 이상 이어지는 곳
+                is_band = np.linalg.norm(px - band, axis=1) < np.linalg.norm(px - ref, axis=1)
+                run = np.convolve(is_band, np.ones(4), "same") >= 4
+                hit = np.nonzero(run)[0]
+                cut[x] = y0 + hit[0] - 1 if len(hit) else 1e9
+            fin = np.nonzero(cut < 1e8)[0]
+            c = cut[fin]
+            k = 15
+            pad = np.pad(c, k, mode="edge")
+            c = np.array([np.median(pad[i:i + 2 * k + 1]) for i in range(len(c))])
+            c = np.convolve(np.pad(c, 8, mode="edge"), np.ones(17) / 17, "valid")
+            # 굽 타원 안쪽은 그대로, 바깥만 매끈하게 다듬은 값으로 (몇 열짜리 튀는 값 제거)
+            outside = np.abs(xx[fin] - ecx) > ea
+            cut[fin] = np.where(outside, c, cut[fin])
+            # 둥근 아래 모서리는 바깥으로 갈수록 올라가기만 한다 → 컷이 바깥에서 다시
+            # 내려가지 않게(반사가 뾰족하게 남지 않게)
+            # (몇 열짜리 튀는 값은 넓은 중앙값으로 먼저 걸러 낸 뒤 누적 최소)
+            l, r = int(np.ceil(ecx - ea)), int(np.floor(ecx + ea))
+            for side in (np.arange(l - 1, -1, -1), np.arange(r + 1, w)):
+                v = cut[side].copy()
+                ok = v < 1e8
+                if ok.sum() < 3:
+                    continue
+                vv = v[ok]
+                pad = np.pad(vv, 20, mode="edge")
+                vv = np.array([np.median(pad[i:i + 41]) for i in range(len(vv))])
+                v[ok] = vv
+                run = np.minimum.accumulate(np.where(ok, v, np.inf))
+                cut[side] = np.where(np.isfinite(run), run, cut[side])
     else:
         xl, xr = X[keep].min(), X[keep].max()
         cut = np.polyval(p, np.clip(xx, xl, xr))
@@ -384,12 +428,12 @@ def main():
     p.add_argument("--cast", type=float, default=2.2,
                    help="몸통 그늘·드리운 그림자의 크기/진하기 (기본 2.2, 1.0=약하게). "
                         "제품이 떠 보이면 올리기")
-    p.add_argument("--reflect", type=float, default=0.18,
-                   help="반광택 테이블에 비친 제품의 세기 (기본 0.18, 0=반사 없음)")
+    p.add_argument("--reflect", type=float, default=0.0,
+                   help="반광택 테이블에 비친 제품의 세기 (기본 0=반사 없음, 예: 0.18)")
     p.add_argument("--keep-product", action="store_true",
                    help="제품 픽셀을 원본 그대로 유지 (색 보정·자연광 마무리 끔)")
-    p.add_argument("--sat", type=float, default=1.25,
-                   help="제품 채도(바이브런스) 배율. 1.0=그대로, 기본 1.25")
+    p.add_argument("--sat", type=float, default=1.35,
+                   help="제품 채도(바이브런스) 배율. 1.0=그대로, 기본 1.35")
     p.add_argument("--wb", type=float, default=0.6,
                    help="제품에 낀 푸른 기(철판·창가 빛) 보정 정도 0~1, 기본 0.6")
     p.add_argument("--light", type=float, default=1.0,
@@ -432,7 +476,8 @@ def main():
         args.reflect = 0.0
     img_t, alpha = place(img, alpha, h, w, canvas=canvas, center=flat)
     light_x = studio.light_direction(img_t, alpha)
-    grade = None if args.keep_product else dict(sat=args.sat, wb=args.wb, light=args.light)
+    grade = None if args.keep_product else dict(sat=args.sat, wb=args.wb, light=args.light,
+                                                  contrast=1.08)
     cands = studio.recommend_backgrounds(img_t, alpha, ref)
 
     print("배경색 추천:")

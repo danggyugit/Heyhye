@@ -224,8 +224,13 @@ def backdrop_split(w, h, wall_bgr, floor_bgr, seam, floor_y, light_x):
     t = t * t * (3 - 2 * t)
     depth = np.clip((y - seam) / max(h - seam, 1), 0, 1)       # 0: 경계선 → 1: 맨 앞
     floor_col = floor * (0.97 + 0.05 * depth ** 0.7)
-    wall_col = wall * (1 + 0.02 * np.clip((seam - y) / max(seam, 1), 0, 1))
+    # 벽은 바닥에서 가장 진한 색(경계선 바로 앞 바닥색)으로 — 벽이 바닥보다 살짝 차분해
+    # 제품이 앞으로 나와 보인다. wall_bgr 는 호환용으로만 받는다
+    wall = floor * 0.97
+    wall_col = wall * (1 + 0.012 * np.clip((seam - y) / max(seam, 1), 0, 1))
     bg = (wall_col * (1 - t) + floor_col * t) * np.ones((1, w, 1), np.float32)
+    # 같은 색이 만나는 경계선은 아주 얇고 옅은 그늘로만 표시
+    bg *= 1 - 0.025 * np.exp(-((y - seam) / (bw * 2.5)) ** 2)
     bg *= 1 + 0.05 * light_x * ((x / w) * 2 - 1)
     cx = w / 2 + light_x * w * 0.15
     d = np.sqrt(((x - cx) / (0.8 * w)) ** 2 + ((y - floor_y) / (0.9 * h)) ** 2)
@@ -272,19 +277,20 @@ def shadows(alpha, light_x, strength=1.0, cast=1.0):
         sh = cv2.warpAffine(sil, M, (w, h), flags=cv2.INTER_LINEAR) * floor_w
         return cv2.GaussianBlur(sh, (0, 0), max(sigma, 0.5))
 
-    contact = under(a * 0.006, a * 0.008)
-    near = under(a * 0.02, a * 0.035)
+    contact = under(a * 0.004, a * 0.016)
+    near = under(a * 0.012, a * 0.05)
     ambient = ell(1.25, 2.0, a * 0.18)
 
     # 드리운 그림자: 높이 hgt 인 점을 (뒤로) sy*hgt 만큼, (옆으로) shear*hgt 만큼 이동
     dirx = -np.sign(light_x) if abs(light_x) > 0.08 else 0.0
     # cast>1 이면 그림자가 더 길고(옆·뒤로) 진해진다
-    shear = 0.55 * min(abs(light_x) * 1.6, 1.0) * dirx * (1 + 0.6 * (cast - 1))
-    sy = 0.22 * (1 + 0.5 * (cast - 1))
+    # 스튜디오 소프트박스: 그림자는 짧게 뒤로, 옆으로는 조금만 (막대처럼 길게 뻗지 않게)
+    shear = 0.18 * min(abs(light_x) * 1.6, 1.0) * dirx
+    sy = 0.12
     M = np.float32([[1, -shear, shear * bot], [0, sy, (1 - sy) * bot]])
     proj = cv2.warpAffine((alpha > 0.5).astype(np.float32), M, (w, h), flags=cv2.INTER_LINEAR)
     dist = np.clip((bot - yy) / (sy * H + 1), 0, 1)       # 0: 굽 근처 → 1: 그림자 끝
-    blurs = [cv2.GaussianBlur(proj, (0, 0), s) for s in (a * 0.05, a * 0.11, a * 0.22)]
+    blurs = [cv2.GaussianBlur(proj, (0, 0), s) for s in (a * 0.10, a * 0.22, a * 0.40)]
     k = dist * 2
     cast_map = np.where(k < 1, blurs[0] * (1 - k) + blurs[1] * k,
                         blurs[1] * (2 - k) + blurs[2] * (k - 1))
@@ -301,8 +307,8 @@ def shadows(alpha, light_x, strength=1.0, cast=1.0):
                 cv2.LINE_AA)
     body = cv2.GaussianBlur(body, (0, 0), maxw * 0.22)
 
-    s = (contact * 0.55 + near * 0.30 * cast ** 0.5 + ambient * 0.15 * cast
-         + cast_map * 0.24 * cast + body * 0.22 * (cast - 1))
+    s = (contact * 0.42 + near * 0.28 * cast ** 0.5 + ambient * 0.15 * cast
+         + cast_map * 0.16 * cast ** 0.5 + body * 0.20 * (cast - 1))
     return np.clip(s * strength, 0, 0.8)
 
 
@@ -460,7 +466,7 @@ def window_light(bg, alpha, light_x, seam, strength=1.0):
     sil = (alpha > 0.5).astype(np.float32)
     M = np.float32([[1, 0, -side * r * 0.18], [0, 1, -r * 0.03]])
     ws = cv2.GaussianBlur(cv2.warpAffine(sil, M, (w, h)), (0, 0), r * 0.09) * above
-    gain = 1 + 0.06 * strength * patch - 0.10 * strength * ws
+    gain = 1 + 0.06 * strength * patch - 0.06 * strength * ws
     return bg * gain[..., None]
 
 
@@ -479,12 +485,12 @@ def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, styl
         style = choose_backdrop(alpha)
     prod = img_t.astype(np.float32)
     if grade is not None:
-        prod = grade_product(img_t, alpha, wall_bgr, grade.get("sat", 1.25),
-                             grade.get("wb", 0.6), grade.get("contrast", 1.05))
+        prod = grade_product(img_t, alpha, wall_bgr, grade.get("sat", 1.35),
+                             grade.get("wb", 0.6), grade.get("contrast", 1.08))
     if style == "flat":
         bg = backdrop_flat(w, h, wall_bgr, light_x)
         s = shadows_flat(alpha, light_x, shadow_strength)[..., None]
-        shade = np.asarray(wall_bgr, np.float32) * 0.42
+        shade = np.asarray(wall_bgr, np.float32) * np.array([0.46, 0.52, 0.58], np.float32)
         bg = bg * (1 - s) + shade * s
     else:
         if style == "split":
@@ -496,7 +502,7 @@ def render(img_t, alpha, wall_bgr, floor_bgr, light_x, shadow_strength=1.0, styl
             bg = backdrop(w, h, wall_bgr, floor_bgr, bot, light_x)
         s = shadows(alpha, light_x, shadow_strength, cast)[..., None]
         # 그림자 색: 바닥색을 어둡고 약간 진하게 (회색이 아닌 같은 톤의 그늘)
-        shade = np.asarray(floor_bgr, np.float32) * 0.42
+        shade = np.asarray(floor_bgr, np.float32) * np.array([0.46, 0.52, 0.58], np.float32)
         bg = bg * (1 - s) + shade * s
         if grade is not None and style == "split":
             bg = window_light(bg, alpha, light_x, seam_y(alpha, wall), grade.get("light", 1.0))
