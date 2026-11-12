@@ -100,6 +100,11 @@ def main():
     p.add_argument("--size", type=int, default=512, help="IC-Light 처리 긴 변 해상도(64의 배수)")
     p.add_argument("--strength", type=float, default=1.0, help="조명 변화 적용 정도 0~1")
     p.add_argument("--lowres-out", help="IC-Light 저해상도 결과 저장(확인용)")
+    p.add_argument("--lowres-in", help="저장해 둔 IC-Light 저해상도 결과를 재사용(AI 단계 생략)")
+    p.add_argument("--color", action="store_true",
+                   help="밝기뿐 아니라 색 변화도 옮긴다(기본은 밝기만: 제품 고유색 유지)")
+    p.add_argument("--relight-background", action="store_true",
+                   help="배경에도 AI 조명 변화를 적용(기본은 제품에만)")
     args = p.parse_args()
 
     comp = cv2.imread(args.composite)
@@ -116,9 +121,12 @@ def main():
         hole = (cv2.dilate((am[..., 0] > 0.02).astype(np.uint8), np.ones((9, 9))) * 255)
         bg = cv2.inpaint(small, hole, 15, cv2.INPAINT_TELEA)
 
-    models = load_models()
-    torch.set_num_threads(max(1, torch.get_num_threads()))
-    relit = relight_lowres(fg, bg, args.prompt, args.neg, args.steps, args.cfg, args.seed, models)
+    if args.lowres_in:      # 이미 만든 AI 결과를 재사용(조명 옮기는 방식만 바꿔 볼 때)
+        relit = cv2.resize(cv2.imread(args.lowres_in), (w, h), interpolation=cv2.INTER_AREA)
+    else:
+        models = load_models()
+        torch.set_num_threads(max(1, torch.get_num_threads()))
+        relit = relight_lowres(fg, bg, args.prompt, args.neg, args.steps, args.cfg, args.seed, models)
     if args.lowres_out:
         cv2.imwrite(args.lowres_out, relit)
 
@@ -132,8 +140,13 @@ def main():
             cv2.GaussianBlur((x.astype(np.float32) + 1) * mm[..., None], (0, 0), k)
         den = 1.0 if mm is None else cv2.GaussianBlur(mm, (0, 0), k)[..., None] + 1e-4
         return num / den
+    def luma(x):  # 색은 그대로 두고 밝기 변화만 옮기도록 (유약 색이 바래지 않게)
+        g = cv2.cvtColor(x, cv2.COLOR_BGR2GRAY)
+        return np.dstack([g, g, g])
+    src_r, src_s = (relit, small) if args.color else (luma(relit), luma(small))
+
     def ratio(mm):
-        r = lowfreq(relit, mm) / lowfreq(small, mm)
+        r = lowfreq(src_r, mm) / lowfreq(src_s, mm)
         cover = cv2.GaussianBlur(mm, (0, 0), k)[..., None]
         return np.where(cover > 1e-3, np.nan_to_num(r, nan=1.0), 1.0)
     g_fg, g_bg = ratio(m), ratio(1 - m)
@@ -141,6 +154,8 @@ def main():
     gfg = cv2.resize(np.clip(g_fg, 0.55, 1.6), (W, H), interpolation=cv2.INTER_CUBIC)
     gbg = cv2.resize(np.clip(g_bg, 0.55, 1.6), (W, H), interpolation=cv2.INTER_CUBIC)
     A = a[..., None]
+    if not args.relight_background:   # 배경·그림자는 우리가 만든 그대로 둔다
+        gbg = np.ones_like(gbg)
     gain = 1 + ((gfg * A + gbg * (1 - A)) - 1) * args.strength
     out = np.clip(comp.astype(np.float32) * gain, 0, 255).astype(np.uint8)
     cv2.imwrite(args.output, out, [cv2.IMWRITE_JPEG_QUALITY, 97])

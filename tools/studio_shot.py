@@ -42,6 +42,8 @@ def build_parser():
                    help="벽→바닥 전환 위치: 바닥 닿는 선보다 캔버스 높이의 몇 배 위")
     g.add_argument("--horizon-soft", type=float, default=0.26,
                    help="벽→바닥이 섞이는 폭(캔버스 높이 비율). 클수록 경계 없이 부드럽게")
+    g.add_argument("--relight-inputs",
+                   help="이 폴더에 relight.py 입력(마스크·빈 배경·합성 PNG)을 함께 저장")
     g.add_argument("--shade", type=float, default=0.12,
                    help="제품에 입히는 방향성 음영(빛 반대쪽이 어두워지는 정도)")
     p.set_defaults(out_dir="samples/studio", light="right", reflect=0.0,
@@ -138,6 +140,12 @@ def main():
 
     res = os.path.join(P.out_dir, f"{name}_studio.jpg")
     cv2.imwrite(res, out, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if P.relight_inputs:   # relight.py 용: 제품 마스크와 제품 없는 배경(그림자 포함)
+        cv2.imwrite(os.path.join(P.relight_inputs, f"{name}_mask.png"),
+                    (np.clip(comp_a, 0, 1) * 255).astype(np.uint8))
+        cv2.imwrite(os.path.join(P.relight_inputs, f"{name}_bg.png"),
+                    np.clip(np.rint(bg), 0, 255).astype(np.uint8))
+        cv2.imwrite(os.path.join(P.relight_inputs, f"{name}_comp.png"), out)
     oh = 1000
     o_small = cv2.resize(img, (int(img.shape[1] * oh / img.shape[0]), oh), interpolation=cv2.INTER_AREA)
     gap = np.full((oh, 16, 3), 255, np.uint8)
