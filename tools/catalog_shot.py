@@ -10,8 +10,8 @@
      - 접촉 그림자: 굽 바닥 타원(제품 밑면 윤곽에서 추정)을 따라 맞닿는 부분이 가장
        진하고, 타원 밖으로 갈수록 타원형 그라디언트로 빠르게 옅어짐
      - 앰비언트 오클루전: 제품 실루엣 하단 윤곽에서의 거리로 계산한 넓고 옅은 그늘
-     - 드리운 그림자: 빛 반대쪽으로 길게 눕는 타원형 그라디언트, 멀어질수록
-       더 흐리고 옅어짐(조명 방향은 제품 하이라이트로 자동 추정 또는 지정)
+     - 드리운 그림자: 제품 실루엣을 빛 반대쪽 바닥에 사선으로 눕힌 그림자,
+       굽에서 멀어질수록 더 흐리고 옅어짐(조명 방향은 자동 추정 또는 --light)
      그림자 색은 회색이 아니라 바닥색을 따뜻하게 어둡게 한 색
   5) 제품 어울림(기본): 색 끼임 제거, 제품 하단 AO, 바닥 반사광, 라이트 랩, 윤곽 완화.
      형태·크기는 그대로(평행이동만). --keep-product 를 주면 제품 픽셀을 원본 그대로
@@ -70,11 +70,16 @@ def build_parser():
     g.add_argument("--ao-strength", type=float, default=0.32)
     g.add_argument("--ao-size", type=float, default=0.5,
                    help="앰비언트 오클루전 범위(굽 반지름 대비)")
-    g.add_argument("--cast-strength", type=float, default=0.3)
-    g.add_argument("--cast-length", type=float, default=0.9,
-                   help="드리운 그림자 길이(굽 반지름 대비)")
-    g.add_argument("--cast-blur", type=float, default=0.18,
-                   help="드리운 그림자 흐림(굽 반지름 대비)")
+    g.add_argument("--cast-strength", type=float, default=0.7,
+                   help="사선 그림자 진하기")
+    g.add_argument("--cast-length", type=float, default=1.25,
+                   help="사선 그림자가 옆으로 뻗는 길이(제품 높이 대비)")
+    g.add_argument("--cast-rise", type=float, default=0.22,
+                   help="사선 그림자가 뒤(화면 위쪽)로 올라가는 정도(제품 높이 대비)")
+    g.add_argument("--cast-blur", type=float, default=0.04,
+                   help="사선 그림자 흐림(제품 높이 대비, 멀어질수록 최대 1.2배)")
+    g.add_argument("--cast-fade", type=float, default=0.55,
+                   help="그림자 끝으로 갈수록 옅어지는 정도 0~1")
     g.add_argument("--opacity", type=float, default=1.0, help="그림자 전체 투명도 배율")
     g.add_argument("--shadow-tint", default="0.56,0.61,0.68",
                    help="그림자 색 = 바닥색 × 이 값 (B,G,R; 파랑을 더 줄이면 따뜻한 그늘)")
@@ -133,7 +138,7 @@ def backdrop(w, h, seam, contact_y, light_x, P):
 
 # ------------------------------------------------------------------ 그림자
 
-def shadow_map(alpha, light_x, P):
+def shadow_map(alpha, light_x, P, seam=None):
     """0~1 그림자 농도(곱하기 합성용). 바닥 영역에만 생긴다."""
     h, w = alpha.shape
     cx, cy, a, b, bot = studio.footprint(alpha)
@@ -155,19 +160,39 @@ def shadow_map(alpha, light_x, P):
     ao *= np.clip((yy - (cy - 2 * b)) / (b + 1), 0, 1)           # 몸통 옆 높은 곳은 0
     ao = cv2.GaussianBlur(ao.astype(np.float32), (0, 0), max(a * 0.03, 1))
 
-    # 3) 드리운 그림자 — 빛 반대쪽으로 길게, 멀어질수록 흐리고 옅게
-    dirx = -np.sign(light_x) if abs(light_x) > 0.08 else 0.0
-    L = a * P.cast_length
-    ccx = cx + dirx * L * 0.55
-    ra, rb_ = a + L * (0.55 if dirx else 0.25), b * (1.25 + 0.25 * P.cast_length)
-    re = np.sqrt(((xx - ccx) / ra) ** 2 + ((yy - (cy + b * 0.1)) / rb_) ** 2)
-    cast = np.clip(1 - re, 0, 1) ** 1.3
-    along = np.clip(((xx - cx) * (dirx if dirx else 0) + np.abs(yy - cy) * 0.2) / (L + 1), 0, 1)
-    cast *= (1 - 0.65 * along)
-    cast = cv2.GaussianBlur(cast.astype(np.float32), (0, 0), max(a * P.cast_blur, 1))
+    # 3) 드리운 그림자 — 제품이 바닥에 드리운 사선 그림자 (샘플 사진처럼)
+    #    제품을 높이별로 잘라 그 높이의 단면(원 → 원근으로 납작한 타원)을 빛 반대쪽
+    #    바닥으로 밀어 겹친다. 높이 t 인 단면은 옆으로 cast_length*t, 뒤로 cast_rise*t.
+    #    → 제품 폭의 변화(입구가 넓으면 그림자 끝도 넓게)를 따르는 사선 띠가 된다.
+    dirx = -np.sign(light_x) if abs(light_x) > 0.08 else -1.0
+    H = bot - studio.body_top(alpha)
+    kx, ky = P.cast_length * dirx, P.cast_rise
+    pr = float(np.clip(b / max(a, 1), 0.08, 0.6))                  # 원근(바닥 타원 납작함)
+    proj = np.zeros((h, w), np.float32)
+    top = int(bot - H)
+    for yr in range(bot, top - 1, -max(int(H / 80), 1)):
+        c = np.nonzero(sil[yr])[0]
+        if not len(c):
+            continue
+        t = bot - yr
+        hw = (c.max() - c.min()) / 2
+        ccx = (c.max() + c.min()) / 2 + kx * t
+        ccy = cy - ky * t
+        cv2.ellipse(proj, (int(round(ccx)), int(round(ccy))),
+                    (max(int(hw), 1), max(int(hw * pr), 1)), 0, 0, 360, 1.0, -1, cv2.LINE_AA)
+    dist = np.clip((bot - yy) / (ky * H + 1), 0, 1)                 # 0: 굽 근처 → 1: 그림자 끝
+    sig = [max(H * P.cast_blur * f, 1) for f in (0.15, 0.5, 1.2)]
+    bl = [cv2.GaussianBlur(proj, (0, 0), sg) for sg in sig]
+    k = dist * 2
+    cast = np.where(k < 1, bl[0] * (1 - k) + bl[1] * k, bl[1] * (2 - k) + bl[2] * (k - 1))
+    cast *= (1 - P.cast_fade * dist)
+    cast *= (1 - sil)                                               # 제품 위에는 그리지 않음
 
-    s = (P.contact_strength * contact + P.ao_strength * ao + P.cast_strength * cast)
-    s = np.clip(s * floor_zone * P.opacity, 0, 0.85)
+    # 사선 그림자는 바닥 전체(벽·바닥 경계 아래)에, 접촉·AO 는 굽 근처 바닥에만
+    wall_cut = 1.0 if seam is None else np.clip((yy - seam) / (h * 0.006) + 0.5, 0, 1)
+    s = (P.contact_strength * contact + P.ao_strength * ao) * floor_zone \
+        + P.cast_strength * cast * wall_cut
+    s = np.clip(s * P.opacity, 0, 0.85)
     return s
 
 
@@ -268,7 +293,7 @@ def main():
     seam = float(np.clip(bot - P.seam * H, h * 0.15, bot - 0.08 * H))
 
     bg = backdrop(w, h, seam, bot, light_x, P)
-    s = shadow_map(alpha, light_x, P)[..., None]
+    s = shadow_map(alpha, light_x, P, seam)[..., None]
     tint = np.array([float(v) for v in P.shadow_tint.split(",")], np.float32)
     bg = bg * (1 - s * (1 - tint))                                   # 곱하기 합성
     if P.reflect > 0:
