@@ -244,13 +244,15 @@ def backdrop_split(w, h, wall_bgr, floor_bgr, seam, floor_y, light_x):
 STUDIO_WALL = "#E0D7D0"
 
 
-def backdrop_studio(w, h, wall_bgr, seam, floor_y, light_x):
+def backdrop_studio(w, h, wall_bgr, seam, floor_y, light_x, soft=0.04):
     """제품 촬영 스튜디오 배경 (참고 사진 재현).
 
     - 벽: 가운데가 가장 밝고 좌우 가장자리·위쪽으로 갈수록 은은하게 어두워짐
       (가운데를 비추는 조명), 바닥과 만나는 곳 근처가 가장 차분
     - 벽→바닥: 화면 높이 약 4% 폭으로 아주 부드럽게 이어짐 (선이 거의 안 보임)
     - 바닥: 벽보다 밝고 카메라 쪽으로 갈수록 더 밝아짐
+    soft: 벽→바닥이 섞이는 폭(화면 높이 비율). 0.2 이상이면 경계선 없이 벽이 아래로
+          서서히 차분해지다 바닥으로 넓게 밝아지는 무경계(사이클로라마) 배경이 된다.
     """
     lab0 = bgr_to_lab(wall_bgr)[0]
     y = np.arange(h, dtype=np.float32)[:, None]
@@ -258,11 +260,14 @@ def backdrop_studio(w, h, wall_bgr, seam, floor_y, light_x):
     cxn = (x - (w / 2 + light_x * w * 0.08)) / (w / 2)       # 조명 중심을 빛 쪽으로 살짝
     # 벽 명도: 가운데 기준 − 좌우 낙차 − 위쪽 낙차 − 경계 근처 살짝
     top = np.clip(1 - y / max(seam, 1), 0, 1)
-    wall_L = lab0[0] - 11 * cxn ** 2 - 9 * top ** 1.6 - 3 * np.exp(-((y - seam) / (h * 0.08)) ** 2)
+    wide = soft >= 0.12
+    dip = 0.0 if wide else 3 * np.exp(-((y - seam) / (h * 0.08)) ** 2)
+    wall_L = lab0[0] - 11 * cxn ** 2 - 9 * top ** 1.6 - dip
     # 바닥 명도: 경계에서 벽보다 약간 밝게 시작해 앞쪽으로 갈수록 밝게, 좌우 낙차는 약하게
     depth = np.clip((y - seam) / max(h - seam, 1), 0, 1)
-    floor_L = lab0[0] + 1.5 + 4.5 * depth ** 0.8 - 4 * cxn ** 2
-    t = np.clip((y - seam) / (h * 0.04) + 0.5, 0, 1)
+    # 넓게 섞을 때는 좌우 낙차를 벽과 비슷하게 해 가장자리에 단차가 생기지 않게
+    floor_L = lab0[0] + 1.5 + 4.5 * depth ** 0.8 - (7 if wide else 4) * cxn ** 2
+    t = np.clip((y - seam) / (h * soft) + 0.5, 0, 1)
     t = t * t * (3 - 2 * t)
     L = wall_L * (1 - t) + floor_L * t
     A = np.full_like(L, lab0[1])

@@ -40,6 +40,8 @@ def build_parser():
     g.add_argument("--wall", default="#E0D7D0", help="스튜디오 벽 가운데 색(웜그레이)")
     g.add_argument("--horizon", type=float, default=0.10,
                    help="벽→바닥 전환 위치: 바닥 닿는 선보다 캔버스 높이의 몇 배 위")
+    g.add_argument("--horizon-soft", type=float, default=0.26,
+                   help="벽→바닥이 섞이는 폭(캔버스 높이 비율). 클수록 경계 없이 부드럽게")
     g.add_argument("--shade", type=float, default=0.12,
                    help="제품에 입히는 방향성 음영(빛 반대쪽이 어두워지는 정도)")
     p.set_defaults(out_dir="samples/studio", light="right", reflect=0.0,
@@ -114,10 +116,11 @@ def main():
     wall = studio.parse_hex(P.wall)
     _, _, _, _, b0 = studio.footprint(a_t)
     seam = b0 - P.horizon * S
-    bg = studio.backdrop_studio(S, S, wall, seam, b0, light_x)
+    bg = studio.backdrop_studio(S, S, wall, seam, b0, light_x, soft=P.horizon_soft)
     floor_bgr = np.median(bg[min(b0 + 20, S - 1):, :].reshape(-1, 3), 0)
 
-    s = cs.shadow_map(a_t, light_x, P, seam)[..., None]
+    # 경계가 넓게 섞이므로 그림자는 섞임이 시작되는 높이 아래 전체에 허용
+    s = cs.shadow_map(a_t, light_x, P, seam - P.horizon_soft * S / 2)[..., None]
     tint = np.array([float(v) for v in P.shadow_tint.split(",")], np.float32)
     bg = bg * (1 - s * (1 - tint))
     if P.reflect > 0:
