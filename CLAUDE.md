@@ -73,6 +73,12 @@ python tools/replace_background.py <접시>.jpg <결과>.jpg --canvas 2273x1705 
   (lilac_side 에서 발생). birefnet 마스크가 이미 굽 끝에서 끝나면 `none` 을 쓴다.
   새 사진은 먼저 마스크 윤곽을 원본 위에 겹쳐 보고 방식을 고른다.
 
+- 배경·그림자는 제품 사진의 카메라 높이에 맞춘다(`studio_shot.py` 기본): 굽 바닥 타원의 납작함으로
+  내려다보는 각도를 추정해, 벽→바닥 전환 높이와 그림자의 길이·기울기·두께를 계산한다.
+  고정값으로 되돌리면 "붙여 놓은" 느낌이 커진다. 빛은 `--light-elevation`(기본 38도), `--light-back`.
+- 굽이 바닥에 닿는 맨 아래 띠를 어둡게 해야 눌러앉아 보인다(`harmonize_product` 의 tight 항,
+  `--product-ao`). 접촉 그림자는 진하고 좁게(`contact_strength=0.95, contact_size=0.06`).
+
 **제품 색**
 - 푸른 끼 제거를 제품 전체에 적용하면 고유색이 바랜다(모래색 컵이 회색이 됨) →
   흰색에 가까운 저채도 영역에만 적용(`harmonize_product`). 범위를 넓히지 말 것.

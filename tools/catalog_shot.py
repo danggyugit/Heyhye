@@ -81,6 +81,8 @@ def build_parser():
     g.add_argument("--cast-min-depth", type=float, default=0.16,
                    help="사선 그림자의 최소 두께 비율(제품 폭 대비). 낮은 카메라 각도에서 그림자가 "
                         "실처럼 얇아지는 것 방지")
+    g.add_argument("--cast-texture", type=float, default=0.0,
+                   help="그림자 농도의 자연스러운 불균일(0=없음). 멀어질수록 조금씩 얼룩지게")
     g.add_argument("--shadow-color", type=float, default=0.3,
                    help="그림자에 제품 색을 섞는 정도 0~1 (제품 색이 바닥에 은은하게 배어 보이게)")
     g.add_argument("--cast-fade", type=float, default=0.55,
@@ -216,6 +218,15 @@ def shadow_map(alpha, light_x, P, seam=None):
     k = dist * 2
     cast = np.where(k < 1, bl[0] * (1 - k) + bl[1] * k, bl[1] * (2 - k) + bl[2] * (k - 1))
     cast *= (1 - P.cast_fade * dist)
+    # 본그림자(짙은 중심) + 반그림자(옅은 가장자리): 가장자리를 한 번 더 깎아 중심이 더 짙게
+    core = cv2.GaussianBlur(proj, (0, 0), max(H * P.cast_blur * 0.5, 1))
+    cast = cast * (0.7 + 0.3 * np.clip(core * 1.6 - 0.3, 0, 1))
+    # 실제 그림자처럼 농도가 아주 조금 고르지 않게 (저주파 얼룩, 눈에 띄지 않는 수준)
+    if P.cast_texture > 0:
+        rng = np.random.default_rng(7)
+        nz = cv2.resize(rng.random((max(h // 90, 2), max(w // 90, 2))).astype(np.float32), (w, h),
+                        interpolation=cv2.INTER_CUBIC)
+        cast *= 1 - P.cast_texture * (nz - 0.5) * 2 * dist
     cast *= (1 - sil)                                               # 제품 위에는 그리지 않음
 
     # 사선 그림자는 바닥 전체(벽·바닥 경계 아래)에, 접촉·AO 는 굽 근처 바닥에만
@@ -267,6 +278,8 @@ def harmonize_product(img_t, alpha, bg, floor_bgr, P):
     band = max(P.product_ao_height * H, 4)
     near = np.clip(1 - up / band, 0, 1) ** 1.8 * m
     prod = prod * (1 - P.product_ao * near[..., None])
+    tight = np.clip(1 - up / max(band * 0.22, 2), 0, 1) ** 1.5 * m     # 바닥에 닿는 맨 아래 띠
+    prod = prod * (1 - P.product_ao * 0.9 * tight[..., None])
     glow = np.clip(1 - up / (band * 1.8), 0, 1) ** 1.2 * m
     prod = prod + (np.asarray(floor_bgr, np.float32) - prod) * (P.bounce * glow)[..., None] * 0.5
 

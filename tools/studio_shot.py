@@ -42,6 +42,12 @@ def build_parser():
                    help="벽→바닥 전환 위치: 바닥 닿는 선보다 캔버스 높이의 몇 배 위")
     g.add_argument("--horizon-soft", type=float, default=0.26,
                    help="벽→바닥이 섞이는 폭(캔버스 높이 비율). 클수록 경계 없이 부드럽게")
+    g.add_argument("--no-camera-match", dest="camera_match", action="store_false",
+                   help="배경·그림자를 제품 사진의 카메라 높이에 맞추지 않고 고정값 사용")
+    g.add_argument("--light-elevation", type=float, default=38.0,
+                   help="빛의 고도(도). 낮을수록 그림자가 길다")
+    g.add_argument("--light-back", type=float, default=0.5,
+                   help="그림자가 옆(1) 대비 뒤쪽으로 향하는 비율")
     g.add_argument("--fill-holes", action="store_true",
                    help="제품 안쪽 구멍(화분 바닥 물구멍 등)을 제품으로 유지")
     g.add_argument("--relight-inputs",
@@ -51,7 +57,8 @@ def build_parser():
     p.set_defaults(out_dir="samples/studio", light="right", reflect=0.0,
                    shadow_tint="0.60,0.63,0.67", cast_length=1.15, cast_rise=0.28,
                    cast_strength=1.0, cast_blur=0.07, cast_fade=0.4,
-                   contact_strength=0.75, ao_strength=0.2, ao_size=0.3, wrap=0.3)
+                   contact_strength=0.95, contact_size=0.06, ao_strength=0.2, ao_size=0.3,
+                   wrap=0.3, product_ao=0.28, shade=0.16, cast_texture=0.12)
     return p
 
 
@@ -127,7 +134,20 @@ def main():
     a_t[ty:ty + ch, tx:tx + cw] = ca
 
     wall = studio.parse_hex(P.wall)
-    _, _, _, _, b0 = studio.footprint(a_t)
+    _, _, fa, fb, b0 = studio.footprint(a_t)
+    # 카메라 높이 추정: 굽 바닥 타원의 납작함 b/a ≈ sin(카메라가 내려다보는 각도)
+    cam = float(np.clip(fb / max(fa, 1), 0.10, 0.60))
+    if P.camera_match:
+        cos = float(np.sqrt(1 - cam * cam))
+        # 바닥이 화면에서 차지하는 깊이는 sin 에 비례 → 많이 내려다볼수록 벽·바닥 전환이 위로
+        P.horizon = 0.05 + 0.55 * cam
+        # 그림자: 빛 고도 light_elevation, 바닥에서 옆(1)·뒤(light_back) 방향으로 눕는다.
+        # 화면에서 높이 t 인 점의 실제 높이는 t/cos, 바닥의 앞뒤 거리는 sin 만큼 줄어 보인다
+        L = 1.0 / np.tan(np.deg2rad(P.light_elevation)) / cos
+        n = float(np.hypot(1.0, P.light_back))
+        P.cast_length = L / n
+        P.cast_rise = L * P.light_back / n * cam
+        P.cast_min_depth = cam
     seam = b0 - P.horizon * S
     bg = studio.backdrop_studio(S, S, wall, seam, b0, light_x, soft=P.horizon_soft)
     floor_bgr = np.median(bg[min(b0 + 20, S - 1):, :].reshape(-1, 3), 0)
@@ -164,7 +184,7 @@ def main():
     cv2.imwrite(os.path.join(P.out_dir, f"{name}_compare.jpg"),
                 np.hstack([o_small, gap, cv2.resize(out, (oh, oh), interpolation=cv2.INTER_AREA)]),
                 [cv2.IMWRITE_JPEG_QUALITY, 92])
-    print(f"{name}: {S}x{S}, 제품 배율 {f:.2f}, 저장 {res}")
+    print(f"{name}: {S}x{S}, 제품 배율 {f:.2f}, 카메라 {np.degrees(np.arcsin(cam)):.0f}도, 저장 {res}")
 
 
 if __name__ == "__main__":
