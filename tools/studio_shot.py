@@ -48,6 +48,13 @@ def build_parser():
                    help="빛의 고도(도). 낮을수록 그림자가 길다")
     g.add_argument("--light-back", type=float, default=0.5,
                    help="그림자가 옆(1) 대비 뒤쪽으로 향하는 비율")
+    g.add_argument("--bg-texture", type=float, default=0.5,
+                   help="배경 표면 결·입자 세기(0=매끈). 제품 사진의 입자감과 맞춰 합성 티를 줄임")
+    g.add_argument("--grade", type=float, default=1.0,
+                   help="제품+배경 전체에 같은 색 보정(약한 대비·따뜻한 색조)을 입히는 정도")
+    g.add_argument("--dehighlight", type=float, default=0.0,
+                   help="제품 표면의 좁은 세로 줄무늬 하이라이트(창문 반사)를 눌러 주는 정도 0~1. "
+                        "제품 광택이 달라지므로 사진별로 확인하고 쓸 것")
     g.add_argument("--fill-holes", action="store_true",
                    help="제품 안쪽 구멍(화분 바닥 물구멍 등)을 제품으로 유지")
     g.add_argument("--relight-inputs",
@@ -55,10 +62,10 @@ def build_parser():
     g.add_argument("--shade", type=float, default=0.12,
                    help="제품에 입히는 방향성 음영(빛 반대쪽이 어두워지는 정도)")
     p.set_defaults(out_dir="samples/studio", light="right", reflect=0.0,
-                   shadow_tint="0.60,0.63,0.67", cast_length=1.15, cast_rise=0.28,
+                   shadow_tint="0.46,0.49,0.53", cast_length=1.15, cast_rise=0.28,
                    cast_strength=1.0, cast_blur=0.07, cast_fade=0.4,
                    contact_strength=0.95, contact_size=0.06, ao_strength=0.2, ao_size=0.3,
-                   wrap=0.3, product_ao=0.28, shade=0.16, cast_texture=0.12)
+                   wrap=0.3, product_ao=0.36, shade=0.16, cast_texture=0.12)
     return p
 
 
@@ -82,6 +89,53 @@ def directional_shade(prod, alpha, light_x, amount):
     # 빛 쪽 +35% · 반대쪽 −100% 비율의 부드러운 곡선 (원통 음영에 가깝게)
     gain = 1 + amount * np.where(u > 0, 0.35 * u, u * (0.6 + 0.4 * -u))
     return prod * gain[..., None]
+
+
+def suppress_highlights(img, alpha, amount):
+    """좁은 세로 줄무늬 하이라이트(매장 창문 반사)를 주변 유약의 밝기·색으로 눌러 준다.
+
+    밝기: 어두운 반점을 먼저 메운 뒤(closing), 가로로 넓은 커널의 opening 으로
+    '폭이 좁은 밝은 구조'만 골라낸다 → 가로 띠(유약 경계)나 넓고 부드러운 밝은 면은 남는다.
+    색: 하이라이트 자리는 주변(하이라이트가 아닌 곳)의 색으로 되돌린다.
+    """
+    m = alpha > 0.5
+    ys, xs = np.nonzero(m)
+    pw, ph = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
+    lab = cv2.cvtColor(img.astype(np.float32) / 255.0, cv2.COLOR_BGR2Lab)
+    L = lab[..., 0]
+    Lm = np.where(m, L, 0).astype(np.float32)
+    k_spk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(int(pw * 0.03) | 1, 3),) * 2)
+    Lc = cv2.morphologyEx(Lm, cv2.MORPH_CLOSE, k_spk)
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                       (max(int(pw * 0.16) | 1, 5), max(int(ph * 0.012) | 1, 3)))
+    spec = np.clip(Lc - cv2.morphologyEx(Lc, cv2.MORPH_OPEN, k_open), 0, None) * m
+    # 세로로 긴 것만 남긴다(물결 테두리처럼 가로로 얇은 밝은 부분은 건드리지 않게)
+    k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(int(ph * 0.05) | 1, 5)))
+    spec = cv2.morphologyEx(spec.astype(np.float32), cv2.MORPH_OPEN, k_v)
+    w = np.clip((spec - 4) / 10, 0, 1)                               # 4 L 이하는 무시
+    w = cv2.GaussianBlur(w.astype(np.float32), (0, 0), max(pw * 0.004, 0.8))
+    keep = ((w < 0.05) & m).astype(np.float32)
+    sig = pw * 0.05
+    den = cv2.GaussianBlur(keep, (0, 0), sig) + 1e-4
+    for c in (0, 1, 2):                                              # 밝기·색을 주변 값으로
+        base = cv2.GaussianBlur(lab[..., c] * keep, (0, 0), sig) / den
+        lab[..., c] += (base - lab[..., c]) * w * amount
+    out = cv2.cvtColor(lab, cv2.COLOR_Lab2BGR) * 255
+    res = img.astype(np.float32).copy()
+    res[m] = out[m]
+    return np.clip(res, 0, 255).astype(np.uint8)
+
+
+def surface_texture(S, amount):
+    """배경지·회벽 같은 은은한 표면 결(곱하기용, 평균 1). 고운 입자 + 느린 얼룩."""
+    rng = np.random.default_rng(11)
+    fine = cv2.GaussianBlur(rng.normal(0, 1, (S, S)).astype(np.float32), (0, 0), 0.9)
+    mid = cv2.resize(rng.normal(0, 1, (S // 6, S // 6)).astype(np.float32), (S, S),
+                     interpolation=cv2.INTER_CUBIC)
+    slow = cv2.resize(rng.normal(0, 1, (S // 120, S // 120)).astype(np.float32), (S, S),
+                      interpolation=cv2.INTER_CUBIC)
+    t = 0.012 * fine / fine.std() + 0.010 * mid / mid.std() + 0.008 * slow / slow.std()
+    return 1 + amount * t
 
 
 def main():
@@ -133,6 +187,9 @@ def main():
     img_t[ty:ty + ch, tx:tx + cw] = crop
     a_t[ty:ty + ch, tx:tx + cw] = ca
 
+    if P.dehighlight > 0:
+        img_t = suppress_highlights(img_t, a_t, P.dehighlight)
+
     wall = studio.parse_hex(P.wall)
     _, _, fa, fb, b0 = studio.footprint(a_t)
     # 카메라 높이 추정: 굽 바닥 타원의 납작함 b/a ≈ sin(카메라가 내려다보는 각도)
@@ -151,6 +208,8 @@ def main():
     seam = b0 - P.horizon * S
     bg = studio.backdrop_studio(S, S, wall, seam, b0, light_x, soft=P.horizon_soft)
     floor_bgr = np.median(bg[min(b0 + 20, S - 1):, :].reshape(-1, 3), 0)
+    if P.bg_texture > 0:
+        bg = bg * surface_texture(S, P.bg_texture)[..., None]
 
     # 경계가 넓게 섞이므로 그림자는 섞임이 시작되는 높이 아래 전체에 허용
     s = cs.shadow_map(a_t, light_x, P, seam - P.horizon_soft * S / 2)[..., None]
@@ -168,6 +227,10 @@ def main():
     out = prod * A + bg * (1 - A)
     # 사진 한 장처럼: 전체에 아주 약한 필름 입자
     out += np.random.default_rng(2).normal(0, 1.2, (S, S, 1)).astype(np.float32)
+    if P.grade > 0:   # 제품과 배경에 같은 보정: 아주 약한 대비 + 따뜻한 색조
+        x = np.clip(out / 255.0, 0, 1)
+        x = x + P.grade * 0.05 * (x - 0.5) * (1 - np.abs(2 * x - 1))        # 중간톤 대비
+        out = x * 255 * (1 + P.grade * np.array([-0.012, 0.0, 0.010], np.float32))
     out = np.clip(np.rint(out), 0, 255).astype(np.uint8)
 
     res = os.path.join(P.out_dir, f"{name}_studio.jpg")
