@@ -42,14 +42,16 @@ def build_parser():
                    help="벽→바닥 전환 위치: 바닥 닿는 선보다 캔버스 높이의 몇 배 위")
     g.add_argument("--horizon-soft", type=float, default=0.26,
                    help="벽→바닥이 섞이는 폭(캔버스 높이 비율). 클수록 경계 없이 부드럽게")
+    g.add_argument("--fill-holes", action="store_true",
+                   help="제품 안쪽 구멍(화분 바닥 물구멍 등)을 제품으로 유지")
     g.add_argument("--relight-inputs",
                    help="이 폴더에 relight.py 입력(마스크·빈 배경·합성 PNG)을 함께 저장")
     g.add_argument("--shade", type=float, default=0.12,
                    help="제품에 입히는 방향성 음영(빛 반대쪽이 어두워지는 정도)")
     p.set_defaults(out_dir="samples/studio", light="right", reflect=0.0,
-                   shadow_tint="0.60,0.63,0.67", cast_length=1.3, cast_rise=0.2,
-                   cast_strength=1.0, cast_blur=0.06, cast_fade=0.35,
-                   contact_strength=0.75, ao_strength=0.35, wrap=0.3)
+                   shadow_tint="0.60,0.63,0.67", cast_length=1.15, cast_rise=0.28,
+                   cast_strength=1.0, cast_blur=0.07, cast_fade=0.4,
+                   contact_strength=0.75, ao_strength=0.2, ao_size=0.3, wrap=0.3)
     return p
 
 
@@ -91,6 +93,15 @@ def main():
     elif P.reflection == "crease":
         alpha = rb.remove_crease_reflection(img, alpha)
 
+    if P.fill_holes:   # 제품 안쪽에 뚫린 구멍(화분 물구멍 등)이 배경으로 빠지지 않게 메운다
+        solid = (alpha > 0.5).astype(np.uint8)
+        n, lab, st, _ = cv2.connectedComponentsWithStats(1 - solid)
+        hh, ww = solid.shape
+        for i in range(n):
+            x, y, bw, bh, _ = st[i]
+            if x > 0 and y > 0 and x + bw < ww and y + bh < hh:
+                alpha[cv2.dilate((lab == i).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0] = 1.0
+
     # 제품만 잘라 캔버스 크기에 맞게 축소
     S = P.out_size
     ys, xs = np.nonzero(alpha > 0.5)
@@ -123,7 +134,8 @@ def main():
 
     # 경계가 넓게 섞이므로 그림자는 섞임이 시작되는 높이 아래 전체에 허용
     s = cs.shadow_map(a_t, light_x, P, seam - P.horizon_soft * S / 2)[..., None]
-    tint = np.array([float(v) for v in P.shadow_tint.split(",")], np.float32)
+    tint = cs.shadow_tint_for(img_t, a_t, [float(v) for v in P.shadow_tint.split(",")],
+                              P.shadow_color)
     bg = bg * (1 - s * (1 - tint))
     if P.reflect > 0:
         refl, ra = studio.reflection(img_t, a_t, P.reflect, length=0.18)

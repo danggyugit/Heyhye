@@ -78,6 +78,11 @@ def build_parser():
                    help="사선 그림자가 뒤(화면 위쪽)로 올라가는 정도(제품 높이 대비)")
     g.add_argument("--cast-blur", type=float, default=0.04,
                    help="사선 그림자 흐림(제품 높이 대비, 멀어질수록 최대 1.2배)")
+    g.add_argument("--cast-min-depth", type=float, default=0.16,
+                   help="사선 그림자의 최소 두께 비율(제품 폭 대비). 낮은 카메라 각도에서 그림자가 "
+                        "실처럼 얇아지는 것 방지")
+    g.add_argument("--shadow-color", type=float, default=0.3,
+                   help="그림자에 제품 색을 섞는 정도 0~1 (제품 색이 바닥에 은은하게 배어 보이게)")
     g.add_argument("--cast-fade", type=float, default=0.55,
                    help="그림자 끝으로 갈수록 옅어지는 정도 0~1")
     g.add_argument("--opacity", type=float, default=1.0, help="그림자 전체 투명도 배율")
@@ -136,6 +141,29 @@ def backdrop(w, h, seam, contact_y, light_x, P):
     return bgr
 
 
+# ------------------------------------------------------------------ 그림자 색
+
+def shadow_tint_for(img_t, alpha, base_tint, mix):
+    """그림자 색 배율(B,G,R). 기본 따뜻한 그늘에 제품 아랫부분의 색조를 mix 만큼 섞는다.
+
+    실제 촬영에서는 제품에서 반사된 빛이 그림자 안을 물들인다(보라 화분 → 살짝 보랏빛
+    그늘). 밝기는 유지하고 색조만 옮기도록 제품 평균색을 그 밝기로 나눠 쓴다.
+    """
+    base = np.asarray(base_tint, np.float32)
+    if mix <= 0:
+        return base
+    ys = np.nonzero(alpha > 0.5)[0]
+    y0 = int(ys.min() + 0.45 * (ys.max() - ys.min()))           # 아래쪽 55% (바닥에 가까운 면)
+    m = alpha[y0:] >= 1.0
+    if m.sum() < 100:
+        return base
+    c = np.median(img_t[y0:][m].astype(np.float32), 0)
+    hue = c / max(float(c.mean()), 1.0)                          # 평균 1 인 색조 벡터
+    hue = 1 + (hue - 1) * 0.6                                    # 과하지 않게 채도 낮춤
+    t = base * (1 - mix + mix * hue)
+    return np.clip(t, 0.2, 0.95)
+
+
 # ------------------------------------------------------------------ 그림자
 
 def shadow_map(alpha, light_x, P, seam=None):
@@ -167,7 +195,8 @@ def shadow_map(alpha, light_x, P, seam=None):
     dirx = -np.sign(light_x) if abs(light_x) > 0.08 else -1.0
     H = bot - studio.body_top(alpha)
     kx, ky = P.cast_length * dirx, P.cast_rise
-    pr = float(np.clip(b / max(a, 1), 0.08, 0.6))                  # 원근(바닥 타원 납작함)
+    # 원근(바닥 타원 납작함). 너무 납작하면 그림자가 실처럼 얇아져 제품 그림자로 안 읽히므로 하한을 둔다
+    pr = float(np.clip(b / max(a, 1), P.cast_min_depth, 0.6))
     proj = np.zeros((h, w), np.float32)
     top = int(bot - H)
     for yr in range(bot, top - 1, -max(int(H / 80), 1)):
@@ -181,7 +210,8 @@ def shadow_map(alpha, light_x, P, seam=None):
         cv2.ellipse(proj, (int(round(ccx)), int(round(ccy))),
                     (max(int(hw), 1), max(int(hw * pr), 1)), 0, 0, 360, 1.0, -1, cv2.LINE_AA)
     dist = np.clip((bot - yy) / (ky * H + 1), 0, 1)                 # 0: 굽 근처 → 1: 그림자 끝
-    sig = [max(H * P.cast_blur * f, 1) for f in (0.15, 0.5, 1.2)]
+    # 굽 근처는 윤곽이 또렷하게(반그림자 좁게), 멀어질수록 넓게 흐려지게
+    sig = [max(H * P.cast_blur * f, 1) for f in (0.06, 0.35, 1.0)]
     bl = [cv2.GaussianBlur(proj, (0, 0), sg) for sg in sig]
     k = dist * 2
     cast = np.where(k < 1, bl[0] * (1 - k) + bl[1] * k, bl[1] * (2 - k) + bl[2] * (k - 1))
@@ -294,7 +324,8 @@ def main():
 
     bg = backdrop(w, h, seam, bot, light_x, P)
     s = shadow_map(alpha, light_x, P, seam)[..., None]
-    tint = np.array([float(v) for v in P.shadow_tint.split(",")], np.float32)
+    tint = shadow_tint_for(img_t, alpha, [float(v) for v in P.shadow_tint.split(",")],
+                           P.shadow_color)
     bg = bg * (1 - s * (1 - tint))                                   # 곱하기 합성
     if P.reflect > 0:
         # 반광택 바닥에 아주 약하게, 짧게, 흐릿하게 비치도록

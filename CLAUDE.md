@@ -35,8 +35,10 @@ python tools/studio_shot.py samples/cup_original.jpg        --model ensemble --r
 python tools/studio_shot.py samples/vase_side_original.jpg  --model birefnet-general --reflection crease
 python tools/studio_shot.py samples/wave_side_original.jpg  --model birefnet-general --reflection crease
 python tools/studio_shot.py samples/purple_cup_original.jpg --model birefnet-general --reflection crease
-# 나머지(planter, sand_cup, pot_bottom, pot_top, vase_top, vase_bottom, wave_top):
+# 나머지(planter, sand_cup, pot_top, vase_top, vase_bottom, wave_top, lilac_side, lilac_top):
 python tools/studio_shot.py samples/<이름>_original.jpg     --model birefnet-general
+# 바닥에 물구멍이 있는 사진(pot_bottom, lilac_bottom): 구멍이 배경으로 빠지지 않게
+python tools/studio_shot.py samples/<이름>_original.jpg     --model birefnet-general --fill-holes
 # 접시(plate_*, rect_*, blue_plate, white_plate, orange_*):
 python tools/replace_background.py <접시>.jpg <결과>.jpg --canvas 2273x1705 --model birefnet-general --reflection none --backdrop flat
 ```
@@ -62,6 +64,14 @@ python tools/replace_background.py <접시>.jpg <결과>.jpg --canvas 2273x1705 
 - 벽·바닥을 좁은 폭(4%)으로 섞고 어두운 띠를 넣으면 "뭉개진 경계"로 보인다 →
   `backdrop_studio(soft=0.26)` 처럼 넓게 섞고 띠를 없앤다.
 - 바닥 반사는 테이블 면 기준으로 뒤집어야 한다(옆면 윤곽 기준이면 몸통 옆에 줄무늬가 생김).
+
+- 그림자가 넓게 번지면 "제품에서 투영된 그림자 같지 않다"는 평가를 받는다 → 굽 근처는 윤곽을
+  또렷하게(블러 작게), 멀어질수록만 흐리게. AO 는 약하게(`ao_strength=0.2`). 낮은 카메라 각도에서
+  그림자가 실처럼 얇아지지 않게 `--cast-min-depth`(기본 0.16)로 두께 하한을 둔다.
+- 그림자 색에는 제품 아랫부분 색조를 은은하게 섞는다(`--shadow-color`, 기본 0.3).
+- `--reflection crease` 는 굽이 몸통보다 좁은 컵에서 아래 모서리를 계단처럼 잘라낼 수 있다
+  (lilac_side 에서 발생). birefnet 마스크가 이미 굽 끝에서 끝나면 `none` 을 쓴다.
+  새 사진은 먼저 마스크 윤곽을 원본 위에 겹쳐 보고 방식을 고른다.
 
 **제품 색**
 - 푸른 끼 제거를 제품 전체에 적용하면 고유색이 바랜다(모래색 컵이 회색이 됨) →
